@@ -73,10 +73,12 @@ class LlfsConan(ConanFile):
             deps += platform_deps[platform.system()]
 
         for dep_name in deps:
+            is_boost = dep_name.startswith("boost/")
+
             self.requires(dep_name,
                           visible=True,
                           transitive_headers=True,
-                          transitive_libs=True,
+                          transitive_libs=(not is_boost),
                           force=True)
 
         for override_name in override_deps:
