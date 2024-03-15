@@ -23,14 +23,21 @@ struct PackedPageRefCount {
   PackedPageId page_id;
   little_i32 ref_count;
 
-  PageRefCount as_page_ref_count() const
+  PageRefCount as_page_ref_count() const noexcept
   {
     return PageRefCount{
         .page_id = this->page_id.unpack(),
         .ref_count = this->ref_count,
     };
   }
+
+  PageRefCount unpack() const noexcept
+  {
+    return this->as_page_ref_count();
+  }
 };
+
+BATT_STATIC_ASSERT_EQ(sizeof(PackedPageRefCount), 12);
 
 LLFS_DEFINE_PACKED_TYPE_FOR(PageRefCount, PackedPageRefCount);
 LLFS_DEFINE_PACKED_TYPE_FOR(PackedPageRefCount, PackedPageRefCount);

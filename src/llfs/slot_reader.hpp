@@ -201,11 +201,11 @@ class TypedSlotReader<PackedVariant<Ts...>> : public SlotReader
 
   using SlotReader::SlotReader;
 
-  template <typename /*Status(const SlotParse&, const CaseT& payload)*/ VisitorFn>
-  StatusOr<usize> run(batt::WaitForResource wait_for_data, VisitorFn&& visitor)
+  template <typename... /*Status(const SlotParse&, const CaseT& payload)*/ VisitorFn>
+  StatusOr<usize> run(batt::WaitForResource wait_for_data, VisitorFn&&... visitor)
   {
-    return this->Super::run(wait_for_data, [&visitor](const SlotParse& slot) mutable -> Status {
-      return TypedSlotReader::visit_slot(slot, slot.body, BATT_FORWARD(visitor));
+    return this->Super::run(wait_for_data, [&visitor...](const SlotParse& slot) mutable -> Status {
+      return TypedSlotReader::visit_slot(slot, slot.body, BATT_FORWARD(visitor)...);
     });
   }
 };
