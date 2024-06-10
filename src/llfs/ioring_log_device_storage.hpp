@@ -97,6 +97,9 @@ class DefaultIoRingLogDeviceStorage
   }
 
   template <typename Handler>
+  void async_write_some(i64 file_offset, const ConstBuffer& data, Handler&& handler);
+
+  template <typename Handler>
   void async_write_some_fixed(i64 file_offset, const ConstBuffer& data, i32 buf_index,
                               Handler&& handler);
 
@@ -112,6 +115,18 @@ class DefaultIoRingLogDeviceStorage
 
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+template <typename Handler>
+inline void DefaultIoRingLogDeviceStorage::async_write_some(i64 file_offset,
+                                                            const ConstBuffer& data,
+                                                            Handler&& handler)
+{
+  this->file_.async_write_some(file_offset, data, BATT_FORWARD(handler));
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
 template <typename Handler>
 inline void DefaultIoRingLogDeviceStorage::async_write_some_fixed(i64 file_offset,
                                                                   const ConstBuffer& data,
