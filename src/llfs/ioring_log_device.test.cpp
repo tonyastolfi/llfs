@@ -194,7 +194,9 @@ TEST(IoringLogDeviceTest, Benchmark)
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
-  llfs::run_log_device_benchmark([&](usize log_size, auto&& consume_log_fn) {
+  llfs::run_log_device_benchmark([&](usize log_size, bool create, auto&& consume_log_fn) {
+    BATT_CHECK(create);
+
     auto scoped_ioring = llfs::ScopedIoRing::make_new(llfs::MaxQueueDepth{queue_depth},
                                                       llfs::ThreadPoolSize{thread_pool_size});
 

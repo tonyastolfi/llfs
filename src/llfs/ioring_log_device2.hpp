@@ -13,63 +13,30 @@
 #include <llfs/config.hpp>
 //
 #include <llfs/basic_ring_buffer_log_device.hpp>
+#include <llfs/ioring_log_config2.hpp>
 #include <llfs/ioring_log_device_storage.hpp>
 #include <llfs/log_device.hpp>
-#include <llfs/packed_page_user_slot.hpp>  // for PackedSlotOffset
+#include <llfs/log_device_runtime_options.hpp>
+#include <llfs/packed_log_control_block2.hpp>
 #include <llfs/ring_buffer.hpp>
 
 #include <batteries/async/watch.hpp>
 #include <batteries/math.hpp>
 #include <batteries/status.hpp>
+#include <batteries/tuples.hpp>
 
 #include <chrono>
 #include <thread>
 
 namespace llfs {
 
-class IoRingLogDevice2Factory;
-
-struct PackedLogControlBlock2 {
-  static constexpr u64 kMagic = 0x128095f84cfba8b0ull;
-
-  big_u64 magic;
-  little_i64 data_offset;
-  little_i64 data_size;
-  PackedSlotOffset trim_pos;
-  PackedSlotOffset flush_pos;
-  little_u32 control_block_size;
-  little_u32 control_header_size;
-  little_i32 device_page_size_log2;
-};
-
-struct IoRingLogConfig2 {
-  i64 control_block_offset;
-  i64 control_block_size;
-  i64 log_capacity;
-  i32 device_page_size_log2;
-};
-
-struct IoRingLogRuntimeOptions2 {
-  usize flush_delay_threshold;
-  usize max_concurrent_writes;
-};
-
-/*
-TODO [tastolfi 2024-06-11] :
-
-DONE 1. Add code to initialize log device 2 within a storage file
-2. Recover state from file
-3. Handler buffers for trim/commit wait handlers; pool for flush writes
-4. Correctly deal with "split" writes at the end of the ring buffer
-DONE 5. Remove extra thread layer (use EventLoopTask directly)
-
- */
+BATT_STRONG_TYPEDEF(slot_offset_type, TargetTrimPos);
+BATT_STRONG_TYPEDEF(slot_offset_type, CommitPos);
 
 /** \brief Initializes an IoRingLogDevice2 using the given storage device and configuration (which
  * includes offset within the passed device).
  */
-template <typename StorageT>
-Status initialize_log_device2(StorageT& storage, const IoRingLogConfig2& config);
+Status initialize_log_device2(RawBlockFile& file, const IoRingLogConfig2& config);
 
 template <typename StorageT>
 class IoRingLogDriver2
@@ -79,32 +46,45 @@ class IoRingLogDriver2
   using AlignedUnit = std::aligned_storage_t<kLogAtomicWriteSize, kLogAtomicWriteSize>;
   using EventLoopTask = typename StorageT::EventLoopTask;
 
+  static constexpr batt::StaticType<TargetTrimPos> kTargetTrimPos{};
+  static constexpr batt::StaticType<CommitPos> kCommitPos{};
+
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
-  explicit IoRingLogDriver2(LogStorageDriverContext& context,         //
-                            const IoRingLogConfig2& config,           //
-                            const IoRingLogRuntimeOptions2& options,  //
-                            StorageT&& storage                        //
+  /** \brief The size (bytes) of each preallocated completion handler memory object.
+   */
+  static constexpr usize kHandlerMemorySize = 160;
+
+  using HandlerMemory = batt::HandlerMemory<kHandlerMemorySize>;
+
+  using HandlerMemoryStorage =
+      std::aligned_storage_t<sizeof(HandlerMemory), alignof(HandlerMemory)>;
+
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
+
+  explicit IoRingLogDriver2(LogStorageDriverContext& context,        //
+                            const IoRingLogConfig2& config,          //
+                            const LogDeviceRuntimeOptions& options,  //
+                            StorageT&& storage                       //
                             ) noexcept
       : context_{context}
       , config_{config}
       , options_{options}
       , storage_{std::move(storage)}
-      , control_block_memory_{new AlignedUnit[(config.control_block_size + sizeof(AlignedUnit) -
-                                               1) /
+      , control_block_memory_{new AlignedUnit[(this->data_page_size_ + sizeof(AlignedUnit) - 1) /
                                               sizeof(AlignedUnit)]}
-      , control_block_buffer_{this->control_block_memory_.get(),
-                              batt::round_up_bits(this->config_.device_page_size_log2,
-                                                  sizeof(PackedLogControlBlock2))}
+      , control_block_buffer_{
+            this->control_block_memory_.get(),
+            batt::round_up_bits(this->config_.data_alignment_log2, sizeof(PackedLogControlBlock2))}
   {
+    BATT_CHECK_GE(this->config_.data_alignment_log2, this->config_.device_page_size_log2);
   }
 
   //----
 
   Status set_trim_pos(slot_offset_type trim_pos)
   {
-    this->target_trim_pos_.set_value(trim_pos);
-
+    this->observed_watch_[kTargetTrimPos].set_value(trim_pos);
     return OkStatus();
   }
 
@@ -134,18 +114,18 @@ class IoRingLogDriver2
 
   Status set_commit_pos(slot_offset_type commit_pos)
   {
-    this->commit_pos_.set_value(commit_pos);
+    this->observed_watch_[kCommitPos].set_value(commit_pos);
     return OkStatus();
   }
 
   slot_offset_type get_commit_pos() const
   {
-    return this->commit_pos_.get_value();
+    return this->observed_watch_[kCommitPos].get_value();
   }
 
   StatusOr<slot_offset_type> await_commit_pos(slot_offset_type min_offset)
   {
-    return await_slot_offset(min_offset, this->commit_pos_);
+    return await_slot_offset(min_offset, this->observed_watch_[kCommitPos]);
   }
 
   //----
@@ -160,12 +140,18 @@ class IoRingLogDriver2
     return OkStatus();
   }
 
+  Status force_close()
+  {
+    return this->storage_.close();
+  }
+
   void halt()
   {
-    this->target_trim_pos_.close();
+    for (batt::Watch<llfs::slot_offset_type>& watch : this->observed_watch_) {
+      watch.close();
+    }
     this->trim_pos_.close();
     this->flush_pos_.close();
-    this->commit_pos_.close();
     this->storage_.on_work_finished();
   }
 
@@ -182,8 +168,35 @@ class IoRingLogDriver2
  private:
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
+  /** \brief Returns the current value of either the TargetTrimPos or CommitPos Watch.
+   */
+  template <typename T>
+  T observe(T) const noexcept
+  {
+    return T{this->observed_watch_[batt::StaticType<T>{}].get_value()};
+  }
+
+  /** \brief Reads the control block into memory and initializes member data that depend on it.
+   */
   Status read_control_block();
+
+  /** \brief Reads the entire contents of the log into the ring buffer.
+   */
   Status read_log_data();
+
+  /** \brief Returns upper bound of known slot commit points recovered from the control block.
+   *
+   * This will either be the highest of the commit points inside the control block, without
+   * exceeding the recovered flush position, or the recovered trim position, whichever is greater.
+   */
+  slot_offset_type recover_flushed_commit_point() const noexcept;
+
+  /** \brief Starts at the value returned by this->recover_flushed_commit_point() and scans forward
+   * in the log data, parsing slot headers until we reach a partially flushed slot or run out of
+   * data.  Calls this->reset_flush_pos with the slot upper bound of the highest confirmed slot from
+   * the scan.
+   */
+  Status recover_flush_pos() noexcept;
 
   /** \brief Forces all slot lower bound pointers to `new_trim_pos`.
    *
@@ -209,66 +222,66 @@ class IoRingLogDriver2
 
   //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
   //
-  void poll(slot_offset_type observed_commit_pos, slot_offset_type observed_target_trim_pos)
+  void poll(CommitPos observed_commit_pos, TargetTrimPos observed_target_trim_pos)
   {
     LLFS_VLOG(1) << "poll(" << observed_commit_pos << ", " << observed_target_trim_pos << ")";
 
     this->start_flush(observed_commit_pos);
     this->start_control_block_update(observed_target_trim_pos);
-    this->wait_for_target_trim_pos(observed_target_trim_pos);
-    this->wait_for_commit_pos(observed_commit_pos);
+    this->wait_for_slot_offset_change(TargetTrimPos{observed_target_trim_pos});
+    this->wait_for_slot_offset_change(CommitPos{observed_commit_pos});
+  }
+
+  void poll(TargetTrimPos observed_target_trim_pos)
+  {
+    this->poll(this->observe(CommitPos{}), observed_target_trim_pos);
+  }
+
+  void poll(CommitPos observed_commit_pos)
+  {
+    this->poll(observed_commit_pos, this->observe(TargetTrimPos{}));
   }
 
   //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
   //
-  void wait_for_target_trim_pos(slot_offset_type observed_target_trim_pos)
+  template <typename T>
+  void wait_for_slot_offset_change(T observed_value)
   {
-    if (this->waiting_on_target_trim_pos_) {
+    static constexpr batt::StaticType<T> kKey;
+
+    if (this->waiting_[kKey]) {
       return;
     }
+    this->waiting_[kKey] = true;
 
-    this->waiting_on_target_trim_pos_ = true;
+    HandlerMemory* const p_mem = this->alloc_handler_memory();
 
-    LLFS_VLOG(1) << "wait_for_target_trim_pos;" << BATT_INSPECT(observed_target_trim_pos);
+    this->observed_watch_[kKey].async_wait(
+        observed_value,
 
-    this->target_trim_pos_.async_wait(
-        observed_target_trim_pos,
-        this->make_watch_handler([this](const StatusOr<slot_offset_type>& new_target_trim_pos) {
-          LLFS_VLOG(1) << BATT_INSPECT(new_target_trim_pos);
+        // Use pre-allocated memory to store the handler in the watch observer list.
+        //
+        batt::make_custom_alloc_handler(
+            *p_mem, [this, p_mem](const StatusOr<slot_offset_type>& new_value) mutable {
+              // The callback must run on the IO event loop task thread, so post it
+              // here, re-using the pre-allocated handler memory.
+              //
+              this->storage_.post_to_event_loop(batt::make_custom_alloc_handler(
+                  *p_mem, [this, p_mem, new_value](const StatusOr<i32>& /*ignored*/) {
+                    // We no longer need the handler memory, so free now.
+                    //
+                    this->free_handler_memory(p_mem);
 
-          this->waiting_on_target_trim_pos_ = false;
+                    this->waiting_[kKey] = false;
 
-          if (!new_target_trim_pos.ok()) {
-            this->context_.update_error_status(new_target_trim_pos.status());
-            return;
-          }
+                    if (!new_value.ok()) {
+                      this->context_.update_error_status(new_value.status());
+                      return;
+                    }
 
-          this->poll(this->commit_pos_.get_value(), *new_target_trim_pos);
-        }));
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void wait_for_commit_pos(slot_offset_type observed_commit_pos)
-  {
-    if (this->waiting_on_commit_pos_) {
-      return;
-    }
-
-    this->waiting_on_commit_pos_ = true;
-
-    this->commit_pos_.async_wait(
-        observed_commit_pos,
-        this->make_watch_handler([this](const StatusOr<slot_offset_type>& new_commit_pos) {
-          this->waiting_on_commit_pos_ = false;
-
-          if (!new_commit_pos.ok()) {
-            this->context_.update_error_status(new_commit_pos.status());
-            return;
-          }
-
-          this->poll(*new_commit_pos, this->target_trim_pos_.get_value());
-        }));
+                    this->poll(T{*new_value});
+                  }));
+            }));
   }
 
   //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -276,9 +289,9 @@ class IoRingLogDriver2
   SlotRange get_aligned_range(const SlotRange& slot_range) const noexcept
   {
     return SlotRange{
-        .lower_bound = batt::round_down_bits(this->config_.device_page_size_log2,  //
+        .lower_bound = batt::round_down_bits(this->config_.data_alignment_log2,  //
                                              slot_range.lower_bound),
-        .upper_bound = batt::round_up_bits(this->config_.device_page_size_log2,  //
+        .upper_bound = batt::round_up_bits(this->config_.data_alignment_log2,  //
                                            slot_range.upper_bound),
     };
   }
@@ -288,7 +301,7 @@ class IoRingLogDriver2
   SlotRange get_aligned_tail(const SlotRange& aligned_range) const noexcept
   {
     return SlotRange{
-        .lower_bound = aligned_range.upper_bound - this->device_page_size_,
+        .lower_bound = aligned_range.upper_bound - this->data_page_size_,
         .upper_bound = aligned_range.upper_bound,
     };
   }
@@ -314,25 +327,35 @@ class IoRingLogDriver2
     slot_offset_type flush_lower_bound = this->unflushed_upper_bound_;
 
     for (usize repeat = 0; repeat < 2; ++repeat) {
+      //----- --- -- -  -  -   -
+
+      // Don't start a write if we are at the max concurrent writes limit.
+      //
       if (this->writes_pending_ == this->options_.max_concurrent_writes) {
         LLFS_VLOG(1) << "start_flush - at max writes pending";
         break;
       }
 
+      // Don't start a write if we have no data to flush.
+      //
       const usize unflushed_size = slot_clamp_distance(flush_lower_bound, observed_commit_pos);
       if (unflushed_size == 0) {
         LLFS_VLOG(1) << "start_flush - unflushed_size == 0";
         break;
       }
 
+      // Don't start a write if there is already a pending write and we aren't at the threshold.
+      //
       if (this->writes_pending_ != 0 && unflushed_size < this->options_.flush_delay_threshold) {
         LLFS_VLOG(1) << "start_flush - no action taken: " << BATT_INSPECT(unflushed_size)
                      << BATT_INSPECT(this->writes_pending_);
         break;
       }
 
+      // All gates have been passed!  We are ready to flush some data.
+      //
       SlotRange slot_range{
-          .lower_bound = this->unflushed_upper_bound_,
+          .lower_bound = flush_lower_bound,
           .upper_bound = observed_commit_pos,
       };
 
@@ -383,7 +406,7 @@ class IoRingLogDriver2
     }
   }
 
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+  //==#==========+=t=+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
   //
   void start_flush_write(const SlotRange& slot_range, const SlotRange& aligned_range) noexcept
   {
@@ -407,12 +430,11 @@ class IoRingLogDriver2
 
     BATT_CHECK_LE(this->writes_pending_, this->options_.max_concurrent_writes);
 
-    this->storage_.async_write_some(
-        write_offset, buffer,
-        this->make_write_handler([this, slot_range, aligned_range](StatusOr<i32> result) {
-          --this->writes_pending_;
-          this->handle_flush_write(slot_range, aligned_range, result);
-        }));
+    this->async_write_some(write_offset, buffer,
+                           [this, slot_range, aligned_range](StatusOr<i32> result) {
+                             --this->writes_pending_;
+                             this->handle_flush_write(slot_range, aligned_range, result);
+                           });
   }
 
   //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -450,7 +472,7 @@ class IoRingLogDriver2
 
     this->update_known_flush_pos(flushed_range);
 
-    const slot_offset_type observed_commit_pos = this->commit_pos_.get_value();
+    const auto observed_commit_pos = this->observe(CommitPos{});
 
     if (!is_tail) {
       SlotRange updated_range{
@@ -463,214 +485,85 @@ class IoRingLogDriver2
       }
     }
 
-    this->poll(observed_commit_pos, this->target_trim_pos_.get_value());
+    this->poll(observed_commit_pos, this->observe(TargetTrimPos{}));
   }
 
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void update_known_flush_pos(const SlotRange& flushed_range) noexcept
-  {
-    LLFS_DVLOG(1) << "update_known_flush_pos(" << flushed_range << ")"
-                  << BATT_INSPECT(this->known_flush_pos_) << " (before)";
+  /** \brief Updates this->known_flush_pos_ to include the passed flushed_range.
+   *
+   * Inserts the flushed range into this->flushed_ranges_ min-heap and then consumes all available
+   * contiguous ranges to advance this->known_flush_pos_.
+   *
+   * This should be called once some slot range is known to have been successfully flushed to the
+   * storage media.
+   */
+  void update_known_flush_pos(const SlotRange& flushed_range) noexcept;
 
-    this->flushed_ranges_.emplace_back(flushed_range);
-    std::push_heap(this->flushed_ranges_.begin(), this->flushed_ranges_.end(), SlotRangePriority{});
+  /** \brief Initiates a rewrite of the control block if necessary.
+   *
+   * The control block must be updated when the target trim pos or unknown flush pos become out of
+   * sync with the last written values.
+   *
+   * Only one pending async write to the control block is allowed at a time.
+   */
+  void start_control_block_update(slot_offset_type observed_target_trim_pos) noexcept;
 
-    while (!this->flushed_ranges_.empty()) {
-      SlotRange& next_range = this->flushed_ranges_.front();
+  /** \brief I/O callback that handles the completion of a write to the control block.
+   */
+  void handle_control_block_update(StatusOr<i32> result) noexcept;
 
-      if (next_range.lower_bound == this->known_flush_pos_) {
-        this->known_flush_pos_ = next_range.upper_bound;
-        std::pop_heap(this->flushed_ranges_.begin(), this->flushed_ranges_.end(),
-                      SlotRangePriority{});
-        this->flushed_ranges_.pop_back();
-        continue;
-      }
-
-      LLFS_CHECK_SLOT_LT(this->known_flush_pos_, next_range.lower_bound);
-      break;
-    }
-
-    LLFS_DVLOG(1) << BATT_INSPECT(this->known_flush_pos_) << " (after)";
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void start_control_block_update(slot_offset_type observed_target_trim_pos) noexcept
-  {
-    if (this->writing_control_block_) {
-      LLFS_DVLOG(1) << "start_control_block_update() - already flushing";
-      return;
-    }
-
-    LLFS_DVLOG(1) << "start_control_block_update() - checking for updates";
-
-    BATT_CHECK_NOT_NULLPTR(this->control_block_);
-
-    slot_offset_type observed_trim_pos = this->trim_pos_.get_value();
-    slot_offset_type observed_flush_pos = this->flush_pos_.get_value();
-
-    if (observed_trim_pos == observed_target_trim_pos &&
-        observed_flush_pos == this->known_flush_pos_) {
-      return;
-    }
-
-    LLFS_VLOG(1) << "start_control_block_update(): trim=" << observed_trim_pos << "->"
-                 << observed_target_trim_pos << " flush=" << observed_flush_pos << "->"
-                 << this->known_flush_pos_;
-
-    this->control_block_->trim_pos = observed_target_trim_pos;
-    this->control_block_->flush_pos = this->known_flush_pos_;
-    this->writing_control_block_ = true;
-
-    this->storage_.async_write_some(this->config_.control_block_offset, this->control_block_buffer_,
-                                    this->make_write_handler([this](StatusOr<i32> result) {
-                                      this->handle_control_block_update(result);
-                                    }));
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void handle_control_block_update(StatusOr<i32> result) noexcept
-  {
-    LLFS_VLOG(1) << "handle_control_block_update(" << result << ")";
-
-    BATT_CHECK(this->writing_control_block_);
-
-    this->writing_control_block_ = false;
-
-    if (!result.ok()) {
-      this->context_.update_error_status(result.status());
-      return;
-    }
-
-    const slot_offset_type old_trim_pos =  //
-        this->trim_pos_.set_value(this->control_block_->trim_pos);
-
-    const slot_offset_type old_flush_pos =  //
-        this->flush_pos_.set_value(this->control_block_->flush_pos);
-
-    LLFS_VLOG(1) << "handle_control_block_update(): trim=" << old_trim_pos << "->"
-                 << this->control_block_->trim_pos << " flush=" << old_flush_pos << "->"
-                 << this->control_block_->flush_pos << BATT_INSPECT(this->writes_pending_)
-                 << BATT_INSPECT(this->writes_max_);
-
-    this->poll(this->commit_pos_.get_value(), this->target_trim_pos_.get_value());
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void initialize_handler_memory_pool()
-  {
-    LLFS_VLOG(1) << "initialize_handler_memory_pool()";
-
-    BATT_CHECK_EQ(this->handler_memory_pool_, nullptr);
-
-    usize pool_size = this->options_.max_concurrent_writes + 1 /* control block write */ +
-                      1 /* target_trim_pos_ wait */ + 1 /* commit_pos_ wait */;
-
-    this->handler_memory_.reset(new HandlerMemoryStorage[pool_size]);
-
-    for (usize i = 0; i < pool_size; ++i) {
-      HandlerMemoryStorage* p_storage = std::addressof(this->handler_memory_[i]);
-      auto pp_next = (HandlerMemoryStorage**)p_storage;
-      *pp_next = this->handler_memory_pool_;
-      this->handler_memory_pool_ = p_storage;
-    }
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  batt::HandlerMemory<160>* alloc_handler_memory() noexcept
-  {
-    BATT_CHECK_EQ(this->event_thread_id_, std::this_thread::get_id());
-
-    HandlerMemoryStorage* const p_storage = this->handler_memory_pool_;
-    auto pp_next = (HandlerMemoryStorage**)p_storage;
-    this->handler_memory_pool_ = *pp_next;
-    *pp_next = nullptr;
-
-    LLFS_VLOG(1) << "alloc_handler_memory: " << (void*)p_storage;
-
-    return new (p_storage) batt::HandlerMemory<160>{};
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void free_handler_memory(batt::HandlerMemory<160>* p_mem) noexcept
-  {
-    BATT_CHECK(!p_mem->in_use());
-    BATT_CHECK_EQ(this->event_thread_id_, std::this_thread::get_id());
-
-    using batt::HandlerMemory;
-
-    LLFS_VLOG(1) << "free_handler_memory: " << (void*)p_mem;
-
-    BATT_CHECK(!p_mem->in_use());
-    p_mem->~HandlerMemory<160>();
-    auto p_storage = (HandlerMemoryStorage*)p_mem;
-    auto pp_next = (HandlerMemoryStorage**)p_storage;
-    *pp_next = this->handler_memory_pool_;
-    this->handler_memory_pool_ = p_storage;
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
+  /** \brief Initiates an asynchronous write to the storage media.
+   *
+   * This function MUST only be called on the event loop thread.
+   */
   template <typename HandlerFn>
-  auto make_write_handler(HandlerFn&& handler_fn) noexcept
-  {
-    batt::HandlerMemory<160>* const p_mem = this->alloc_handler_memory();
+  void async_write_some(i64 offset, const ConstBuffer& buffer, HandlerFn&& handler);
 
-    return batt::make_custom_alloc_handler(
-        *p_mem, [this, p_mem, handler_fn = BATT_FORWARD(handler_fn)](const StatusOr<i32>& result) {
-          this->free_handler_memory(p_mem);
-          handler_fn(result);
-        });
-  }
+  /** \brief Allocates an array of HandlerMemoryStorage objects, adding each to the free pool linked
+   * list (this->handler_memory_pool_).
+   */
+  void initialize_handler_memory_pool();
 
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  template <typename HandlerFn>
-  auto make_watch_handler(HandlerFn&& handler_fn) noexcept
-  {
-    batt::HandlerMemory<160>* const p_mem = this->alloc_handler_memory();
+  /** \brief Pops the next HandlerMemoryStorage object off this->handler_memory_pool_ and uses it to
+   * construct a new HandlerMemory object, returning a pointer to the newly constructed
+   * HandlerMemory.
+   *
+   * This function MUST only be called on the event loop thread.
+   */
+  HandlerMemory* alloc_handler_memory() noexcept;
 
-    return batt::make_custom_alloc_handler(
-        *p_mem, [this, p_mem, handler_fn = BATT_FORWARD(handler_fn)](
-                    const StatusOr<slot_offset_type>& new_value) mutable {
-          this->storage_.post_to_event_loop(batt::make_custom_alloc_handler(
-              *p_mem, [this, p_mem, new_value,
-                       handler_fn = std::move(handler_fn)](const StatusOr<i32>& /*ignored*/) {
-                this->free_handler_memory(p_mem);
-                handler_fn(new_value);
-              }));
-        });
-  }
+  /** \brief Destructs the passed HandlerMemory object and adds its storage back to the pool.
+   *
+   * This function MUST only be called on the event loop thread.
+   */
+  void free_handler_memory(HandlerMemory* p_mem) noexcept;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
   LogStorageDriverContext& context_;
   const IoRingLogConfig2 config_;
-  const IoRingLogRuntimeOptions2 options_;
+  const LogDeviceRuntimeOptions options_;
   StorageT storage_;
 
   const usize device_page_size_ = usize{1} << this->config_.device_page_size_log2;
+  const usize data_page_size_ = usize{1} << this->config_.data_alignment_log2;
+  const usize control_block_size_ = this->data_page_size_;
 
   i64 data_begin_;
   i64 data_end_;
 
-  batt::Watch<slot_offset_type> target_trim_pos_{0};
+  batt::StaticTypeMap<std::tuple<TargetTrimPos, CommitPos>, batt::Watch<slot_offset_type>>
+      observed_watch_;
+
+  batt::StaticTypeMap<std::tuple<TargetTrimPos, CommitPos>, bool> waiting_;
+
   batt::Watch<slot_offset_type> trim_pos_{0};
   batt::Watch<slot_offset_type> flush_pos_{0};
-  batt::Watch<slot_offset_type> commit_pos_{0};
 
   slot_offset_type known_flush_pos_ = 0;
   slot_offset_type unflushed_upper_bound_ = 0;
 
   Optional<SlotRange> flush_tail_;
 
-  bool waiting_on_target_trim_pos_ = false;
-  bool waiting_on_commit_pos_ = false;
   bool writing_control_block_ = false;
 
   usize writes_pending_ = 0;
@@ -678,22 +571,35 @@ class IoRingLogDriver2
 
   std::unique_ptr<AlignedUnit[]> control_block_memory_;
 
+  /** \brief The data buffer used to write updates to the control block; points at
+   * this->control_block_memory_.
+   */
   ConstBuffer control_block_buffer_;
 
+  /** \brief Pointer to initialized control block for the log.
+   */
   PackedLogControlBlock2* control_block_ = nullptr;
 
+  /** \brief A min-heap of confirmed flushed slot ranges; used to advance this->known_flush_pos_,
+   * which in turn drives the update of the control block and this->flush_pos_.
+   */
   std::vector<SlotRange> flushed_ranges_;
 
   Optional<EventLoopTask> event_loop_task_;
 
-  using HandlerMemoryStorage =
-      std::aligned_storage_t<sizeof(batt::HandlerMemory<160>), alignof(batt::HandlerMemory<160>)>;
+  std::thread::id event_thread_id_;
 
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
+  // HandlerMemory pool.
+  //----- --- -- -  -  -   -
+
+  /** \brief Aligned storage for HandlerMemory objects.
+   */
   std::unique_ptr<HandlerMemoryStorage[]> handler_memory_;
 
+  /** \brief The head of a single-linked list of free HandlerMemoryStorage objects.
+   */
   HandlerMemoryStorage* handler_memory_pool_ = nullptr;
-
-  std::thread::id event_thread_id_;
 };
 
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
@@ -702,23 +608,27 @@ class IoRingLogDriver2
  * The commit pos and flush pos are always in sync, so there is no difference between
  * LogReadMode::kSpeculative and LogReadMode::kDurable for this log device type.
  */
-class IoRingLogDevice2
+template <typename StorageT>
+class BasicIoRingLogDevice2
     : public BasicRingBufferLogDevice<
-          /*Impl=*/IoRingLogDriver2<DefaultIoRingLogDeviceStorage>>
+          /*Impl=*/IoRingLogDriver2<StorageT>>
 {
  public:
   using Super = BasicRingBufferLogDevice<
-      /*Impl=*/IoRingLogDriver2<DefaultIoRingLogDeviceStorage>>;
+      /*Impl=*/IoRingLogDriver2<StorageT>>;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
-  explicit IoRingLogDevice2(const IoRingLogConfig2& config, const IoRingLogRuntimeOptions2& options,
-                            DefaultIoRingLogDeviceStorage&& storage) noexcept
+  explicit BasicIoRingLogDevice2(const IoRingLogConfig2& config,
+                                 const LogDeviceRuntimeOptions& options,
+                                 StorageT&& storage) noexcept
       : Super{RingBuffer::TempFile{.byte_size = BATT_CHECKED_CAST(usize, config.log_capacity)},
               config, options, std::move(storage)}
   {
   }
 };
+
+using IoRingLogDevice2 = BasicIoRingLogDevice2<DefaultIoRingLogDeviceStorage>;
 
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 /** \brief A factory that produces IoRingLogDevice2 instances of the given size.
@@ -726,12 +636,26 @@ class IoRingLogDevice2
 class IoRingLogDevice2Factory : public LogDeviceFactory
 {
  public:
-  explicit IoRingLogDevice2Factory(slot_offset_type size) noexcept;
+  explicit IoRingLogDevice2Factory(
+      int fd, const FileOffsetPtr<const PackedLogDeviceConfig2&>& packed_config,
+      const LogDeviceRuntimeOptions& options) noexcept;
+
+  explicit IoRingLogDevice2Factory(int fd, const IoRingLogConfig2& config,
+                                   const LogDeviceRuntimeOptions& options) noexcept;
+
+  ~IoRingLogDevice2Factory() noexcept;
+
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
+
+  StatusOr<std::unique_ptr<IoRingLogDevice2>> open_ioring_log_device();
 
   StatusOr<std::unique_ptr<LogDevice>> open_log_device(const LogScanFn& scan_fn) override;
 
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
  private:
-  slot_offset_type size_;
+  int fd_;
+  IoRingLogConfig2 config_;
+  LogDeviceRuntimeOptions options_;
 };
 
 }  // namespace llfs
