@@ -63,7 +63,8 @@ inline Status IoRingLogDriver2<StorageT>::read_control_block()
   const slot_offset_type recovered_trim_pos = p_control_block->trim_pos;
   const slot_offset_type recovered_flush_pos = p_control_block->flush_pos;
 
-  LLFS_LOG_INFO() << BATT_INSPECT(recovered_trim_pos) << BATT_INSPECT(recovered_flush_pos);
+  LLFS_VLOG(1) << BATT_INSPECT(recovered_trim_pos) << BATT_INSPECT(recovered_flush_pos)
+               << BATT_INSPECT(this->control_block_->generation);
 
   LLFS_CHECK_SLOT_LE(recovered_trim_pos, recovered_flush_pos);
 
@@ -78,8 +79,6 @@ inline Status IoRingLogDriver2<StorageT>::read_control_block()
       batt::round_up_to<usize>(this->device_page_size_, p_control_block->control_header_size),
   };
   this->control_block_ = p_control_block;
-
-  LLFS_VLOG(1) << BATT_INSPECT(this->control_block_->generation);
 
   // TODO [tastolfi 2024-06-11] verify control block values against config where possible.
 
