@@ -318,6 +318,12 @@ class SimulatedLogDeviceStorage
     return this->impl_->read_all(offset, buffer);
   }
 
+  template <typename Handler>
+  void async_write_some(i64 file_offset, const ConstBuffer& data, Handler&& handler)
+  {
+    this->impl_->async_write_some(file_offset, data, BATT_FORWARD(handler));
+  }
+
   // The buf_index arg here isn't used by the simulated impl, but it is needed by the other type
   // used to instantiate IoRingLogDriver, DefaultIoRingLogDeviceStorage.
   //

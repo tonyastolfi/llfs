@@ -66,19 +66,7 @@ class IoRingLogDriver2
                             const IoRingLogConfig2& config,          //
                             const LogDeviceRuntimeOptions& options,  //
                             StorageT&& storage                       //
-                            ) noexcept
-      : context_{context}
-      , config_{config}
-      , options_{options}
-      , storage_{std::move(storage)}
-      , control_block_memory_{new AlignedUnit[(this->data_page_size_ + sizeof(AlignedUnit) - 1) /
-                                              sizeof(AlignedUnit)]}
-      , control_block_buffer_{
-            this->control_block_memory_.get(),
-            batt::round_up_bits(this->config_.data_alignment_log2, sizeof(PackedLogControlBlock2))}
-  {
-    BATT_CHECK_GE(this->config_.data_alignment_log2, this->config_.device_page_size_log2);
-  }
+                            ) noexcept;
 
   //----
 
@@ -132,36 +120,11 @@ class IoRingLogDriver2
 
   Status open() noexcept;
 
-  Status close()
-  {
-    this->halt();
-    this->join();
+  Status close();
 
-    return OkStatus();
-  }
+  void halt();
 
-  Status force_close()
-  {
-    return this->storage_.close();
-  }
-
-  void halt()
-  {
-    for (batt::Watch<llfs::slot_offset_type>& watch : this->observed_watch_) {
-      watch.close();
-    }
-    this->trim_pos_.close();
-    this->flush_pos_.close();
-    this->storage_.on_work_finished();
-  }
-
-  void join()
-  {
-    if (this->event_loop_task_) {
-      this->event_loop_task_->join();
-      this->event_loop_task_ = None;
-    }
-  }
+  void join();
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -220,273 +183,75 @@ class IoRingLogDriver2
    */
   void reset_flush_pos(slot_offset_type new_flush_pos);
 
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void poll(CommitPos observed_commit_pos, TargetTrimPos observed_target_trim_pos)
-  {
-    LLFS_VLOG(1) << "poll(" << observed_commit_pos << ", " << observed_target_trim_pos << ")";
+  /** \brief Checks to see what activities can be initiated to advance the state of the driver.
+   *
+   * - Starts flushing data from the ring buffer, if conditions are met (see start_flush)
+   * - Starts updating the control block, if trim/flush are out of date
+   * - Starts waiting for updates from the target trim and commit pos
+   */
+  void poll(CommitPos observed_commit_pos, TargetTrimPos observed_target_trim_pos) noexcept;
 
-    this->start_flush(observed_commit_pos);
-    this->start_control_block_update(observed_target_trim_pos);
-    this->wait_for_slot_offset_change(TargetTrimPos{observed_target_trim_pos});
-    this->wait_for_slot_offset_change(CommitPos{observed_commit_pos});
-  }
-
-  void poll(TargetTrimPos observed_target_trim_pos)
+  /** \brief Convenience function - reads the commit_pos_ and then passes on
+   * `observed_target_trim_pos` to the 2-arg poll.
+   */
+  void poll(TargetTrimPos observed_target_trim_pos) noexcept
   {
     this->poll(this->observe(CommitPos{}), observed_target_trim_pos);
   }
 
-  void poll(CommitPos observed_commit_pos)
+  /** \brief Convenience function - reads the target_trim_pos_ and then passes on
+   * `observed_commit_pos` to the 2-arg poll.
+   */
+  void poll(CommitPos observed_commit_pos) noexcept
   {
     this->poll(observed_commit_pos, this->observe(TargetTrimPos{}));
   }
 
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
+  /** \brief Initiates an async wait on the specified watched value (either CommitPos or
+   * TargetTrimPos), if there is not already a pending wait operation in progress.
+   */
   template <typename T>
-  void wait_for_slot_offset_change(T observed_value)
-  {
-    static constexpr batt::StaticType<T> kKey;
+  void wait_for_slot_offset_change(T observed_value) noexcept;
 
-    if (this->waiting_[kKey]) {
-      return;
-    }
-    this->waiting_[kKey] = true;
+  /** \brief Checks to see if data can be flushed, and initiates at least one async write if so.
+   *
+   * The following conditions must be met to initiate an async write:
+   *
+   *  - The current number of writes pending must be below the maximum limit
+   *  - There must be some unflushed data in the ring buffer
+   *  - The amount of unflushed data must be at least the flush delay threshold OR there are no
+   *    writes pending currently
+   *
+   * If the unflushed data region spans the upper bound of the ring buffer (wrap-around), then up to
+   * two writes may be initiated by this function, provided the conditions above are still met after
+   * starting the first write.
+   */
+  void start_flush(slot_offset_type observed_commit_pos);
 
-    HandlerMemory* const p_mem = this->alloc_handler_memory();
+  /** \brief Returns the passed slot range with the lower and upper bounds aligned to the nearest
+   * data page boundary.
+   */
+  SlotRange get_aligned_range(const SlotRange& slot_range) const noexcept;
 
-    this->observed_watch_[kKey].async_wait(
-        observed_value,
+  /** \brief Returns the slot range corresponding to the trailing data page of the passed range.
+   */
+  SlotRange get_aligned_tail(const SlotRange& aligned_range) const noexcept;
 
-        // Use pre-allocated memory to store the handler in the watch observer list.
-        //
-        batt::make_custom_alloc_handler(
-            *p_mem, [this, p_mem](const StatusOr<slot_offset_type>& new_value) mutable {
-              // The callback must run on the IO event loop task thread, so post it
-              // here, re-using the pre-allocated handler memory.
-              //
-              this->storage_.post_to_event_loop(batt::make_custom_alloc_handler(
-                  *p_mem, [this, p_mem, new_value](const StatusOr<i32>& /*ignored*/) {
-                    // We no longer need the handler memory, so free now.
-                    //
-                    this->free_handler_memory(p_mem);
+  /** \brief Starts writing the aligned range from the ring buffer to the storage media.
+   *
+   * Unlike start_flush, this function unconditionally starts an async write.
+   */
+  void start_flush_write(const SlotRange& slot_range, const SlotRange& aligned_range) noexcept;
 
-                    this->waiting_[kKey] = false;
-
-                    if (!new_value.ok()) {
-                      this->context_.update_error_status(new_value.status());
-                      return;
-                    }
-
-                    this->poll(T{*new_value});
-                  }));
-            }));
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  SlotRange get_aligned_range(const SlotRange& slot_range) const noexcept
-  {
-    return SlotRange{
-        .lower_bound = batt::round_down_bits(this->config_.data_alignment_log2,  //
-                                             slot_range.lower_bound),
-        .upper_bound = batt::round_up_bits(this->config_.data_alignment_log2,  //
-                                           slot_range.upper_bound),
-    };
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  SlotRange get_aligned_tail(const SlotRange& aligned_range) const noexcept
-  {
-    return SlotRange{
-        .lower_bound = aligned_range.upper_bound - this->data_page_size_,
-        .upper_bound = aligned_range.upper_bound,
-    };
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  batt::SmallVec<ConstBuffer, 2> get_unflushed_data(slot_offset_type observed_commit_pos)
-  {
-    batt::SmallVec<ConstBuffer, 2> result;
-
-    if (slot_less_than(this->unflushed_upper_bound_, observed_commit_pos)) {
-      usize n = observed_commit_pos - this->unflushed_upper_bound_;
-      const usize buffer_offset = this->unflushed_upper_bound_ % this->context_.buffer_.size();
-    }
-
-    return result;
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void start_flush(slot_offset_type observed_commit_pos)
-  {
-    slot_offset_type flush_lower_bound = this->unflushed_upper_bound_;
-
-    for (usize repeat = 0; repeat < 2; ++repeat) {
-      //----- --- -- -  -  -   -
-
-      // Don't start a write if we are at the max concurrent writes limit.
-      //
-      if (this->writes_pending_ == this->options_.max_concurrent_writes) {
-        LLFS_VLOG(1) << "start_flush - at max writes pending";
-        break;
-      }
-
-      // Don't start a write if we have no data to flush.
-      //
-      const usize unflushed_size = slot_clamp_distance(flush_lower_bound, observed_commit_pos);
-      if (unflushed_size == 0) {
-        LLFS_VLOG(1) << "start_flush - unflushed_size == 0";
-        break;
-      }
-
-      // Don't start a write if there is already a pending write and we aren't at the threshold.
-      //
-      if (this->writes_pending_ != 0 && unflushed_size < this->options_.flush_delay_threshold) {
-        LLFS_VLOG(1) << "start_flush - no action taken: " << BATT_INSPECT(unflushed_size)
-                     << BATT_INSPECT(this->writes_pending_);
-        break;
-      }
-
-      // All gates have been passed!  We are ready to flush some data.
-      //
-      SlotRange slot_range{
-          .lower_bound = flush_lower_bound,
-          .upper_bound = observed_commit_pos,
-      };
-
-      // Check for split range.
-      {
-        const usize physical_lower_bound = slot_range.lower_bound % this->context_.buffer_.size();
-        const usize physical_upper_bound = slot_range.upper_bound % this->context_.buffer_.size();
-
-        if (physical_lower_bound > physical_upper_bound && physical_upper_bound != 0) {
-          const slot_offset_type new_upper_bound =
-              slot_range.lower_bound + (this->context_.buffer_.size() - physical_lower_bound);
-
-          LLFS_VLOG(1) << "Clipping: " << slot_range.upper_bound << " -> " << new_upper_bound << ";"
-                       << BATT_INSPECT(physical_lower_bound) << BATT_INSPECT(physical_upper_bound);
-
-          slot_range.upper_bound = new_upper_bound;
-        }
-      }
-
-      SlotRange aligned_range = this->get_aligned_range(slot_range);
-
-      // If this flush would overlap with an ongoing one (at the last device page) then trim the
-      // aligned_range so it doesn't.
-      //
-      if (this->flush_tail_) {
-        if (slot_less_than(aligned_range.lower_bound, this->flush_tail_->upper_bound)) {
-          aligned_range.lower_bound = this->flush_tail_->upper_bound;
-          if (aligned_range.empty()) {
-            flush_lower_bound = this->flush_tail_->upper_bound;
-            continue;
-          }
-        }
-      }
-
-      // Replace the current flush_tail_ slot range.
-      //
-      const SlotRange new_flush_tail = this->get_aligned_tail(aligned_range);
-      if (this->flush_tail_) {
-        BATT_CHECK_NE(new_flush_tail, *this->flush_tail_);
-      }
-      BATT_CHECK(!new_flush_tail.empty());
-      this->flush_tail_.emplace(new_flush_tail);
-
-      // Start writing!
-      //
-      this->start_flush_write(slot_range, aligned_range);
-      flush_lower_bound = this->unflushed_upper_bound_;
-    }
-  }
-
-  //==#==========+=t=+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
-  void start_flush_write(const SlotRange& slot_range, const SlotRange& aligned_range) noexcept
-  {
-    LLFS_VLOG(1) << "start_flush_write(" << slot_range << ", " << aligned_range << ")";
-
-    this->unflushed_upper_bound_ = slot_max(this->unflushed_upper_bound_, slot_range.upper_bound);
-
-    const i64 write_offset =
-        this->data_begin_ + (aligned_range.lower_bound % this->context_.buffer_.size());
-
-    ConstBuffer buffer =
-        resize_buffer(this->context_.buffer_.get(aligned_range.lower_bound), aligned_range.size());
-
-    BATT_CHECK_LE(write_offset + (i64)buffer.size(), this->data_end_);
-
-    LLFS_VLOG(1) << " -- async_write_some(offset=" << write_offset << ".."
-                 << write_offset + buffer.size() << ", size=" << buffer.size() << ")";
-
-    ++this->writes_pending_;
-    this->writes_max_ = std::max(this->writes_max_, this->writes_pending_);
-
-    BATT_CHECK_LE(this->writes_pending_, this->options_.max_concurrent_writes);
-
-    this->async_write_some(write_offset, buffer,
-                           [this, slot_range, aligned_range](StatusOr<i32> result) {
-                             --this->writes_pending_;
-                             this->handle_flush_write(slot_range, aligned_range, result);
-                           });
-  }
-
-  //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-  //
+  /** \brief Completion handler for a completed data flush write operation.
+   *
+   * Will initiate another write if the tail of the aligned range is now dirty and another flush
+   * write has been initiated since the write that caused this handler to be called.
+   *
+   * Always calls poll unless there is an error status (result).
+   */
   void handle_flush_write(const SlotRange& slot_range, const SlotRange& aligned_range,
-                          StatusOr<i32> result)
-  {
-    LLFS_VLOG(1) << "handle_flush_result(result=" << result << ")" << BATT_INSPECT(slot_range);
-
-    const usize bytes_written = result.ok() ? *result : 0;
-
-    SlotRange aligned_tail = this->get_aligned_tail(aligned_range);
-
-    SlotRange flushed_range{
-        .lower_bound = slot_max(slot_range.lower_bound, aligned_range.lower_bound),
-        .upper_bound = slot_min(aligned_range.lower_bound + bytes_written, slot_range.upper_bound),
-    };
-
-    const bool is_tail = (this->flush_tail_ && *this->flush_tail_ == aligned_tail);
-    LLFS_DVLOG(1) << BATT_INSPECT(is_tail);
-    if (is_tail) {
-      this->flush_tail_ = None;
-      this->unflushed_upper_bound_ = flushed_range.upper_bound;
-    }
-
-    LLFS_DVLOG(1) << BATT_INSPECT(flushed_range);
-
-    if (!result.ok()) {
-      LLFS_VLOG(1) << "(handle_flush_write) error: " << result.status();
-      this->context_.update_error_status(result.status());
-      return;
-    }
-
-    BATT_CHECK(!flushed_range.empty());
-
-    this->update_known_flush_pos(flushed_range);
-
-    const auto observed_commit_pos = this->observe(CommitPos{});
-
-    if (!is_tail) {
-      SlotRange updated_range{
-          .lower_bound = flushed_range.upper_bound,
-          .upper_bound = slot_min(aligned_range.upper_bound, observed_commit_pos),
-      };
-
-      if (!updated_range.empty()) {
-        this->start_flush_write(updated_range, this->get_aligned_range(updated_range));
-      }
-    }
-
-    this->poll(observed_commit_pos, this->observe(TargetTrimPos{}));
-  }
+                          StatusOr<i32> result);
 
   /** \brief Updates this->known_flush_pos_ to include the passed flushed_range.
    *
@@ -511,12 +276,13 @@ class IoRingLogDriver2
    */
   void handle_control_block_update(StatusOr<i32> result) noexcept;
 
-  /** \brief Initiates an asynchronous write to the storage media.
+  /** \brief Returns a wrapped handler for async writes.
    *
-   * This function MUST only be called on the event loop thread.
+   * Automatically injects `this` as the first arg to `handler`, so that callers need not capture
+   * this in handler itself.
    */
   template <typename HandlerFn>
-  void async_write_some(i64 offset, const ConstBuffer& buffer, HandlerFn&& handler);
+  auto make_write_handler(HandlerFn&& handler);
 
   /** \brief Allocates an array of HandlerMemoryStorage objects, adding each to the free pool linked
    * list (this->handler_memory_pool_).
@@ -539,36 +305,91 @@ class IoRingLogDriver2
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
+  /** \brief The context passed in at construction time; provides access to the ring buffer.
+   */
   LogStorageDriverContext& context_;
+
+  /** \brief The configuration of the log; passed in at construction time.
+   */
   const IoRingLogConfig2 config_;
+
+  /** \brief Runtime configuration options, such as the maximum number of concurrent writes allowed.
+   */
   const LogDeviceRuntimeOptions options_;
+
+  /** \brief Provides access to the underlying storage media.
+   */
   StorageT storage_;
 
+  /** \brief The minimum IO page size for the storage media.
+   */
   const usize device_page_size_ = usize{1} << this->config_.device_page_size_log2;
-  const usize data_page_size_ = usize{1} << this->config_.data_alignment_log2;
-  const usize control_block_size_ = this->data_page_size_;
 
+  /** \brief The size to which data writes must be aligned; this is also the distance from the start
+   * of the control block to the start of the log data storage area.  Typically aligns with memory
+   * pages (4k by default).
+   */
+  const usize data_page_size_ = usize{1} << this->config_.data_alignment_log2;
+
+  /** \brief The absolute file (media) offset of the beginning of the data region.
+   */
   i64 data_begin_;
+
+  /** \brief The absolute file (media) offset of the end (non-inclusive) of the data region.
+   */
   i64 data_end_;
 
+  /** \brief Stores the two externally modifiable Watch objects (target trim pos and commit pos).
+   */
   batt::StaticTypeMap<std::tuple<TargetTrimPos, CommitPos>, batt::Watch<slot_offset_type>>
       observed_watch_;
 
+  /** \brief Stores the wait status of the two observed watches (i.e., whether we are currently
+   * waiting on updates for each watch).
+   */
   batt::StaticTypeMap<std::tuple<TargetTrimPos, CommitPos>, bool> waiting_;
 
+  /** \brief The confirmed trim position; this is set only after a successful re-write of the
+   * control block.
+   */
   batt::Watch<slot_offset_type> trim_pos_{0};
+
+  /** \brief The confirmed flush position; this is set only after a successful re-write of the
+   * control block.
+   */
   batt::Watch<slot_offset_type> flush_pos_{0};
 
-  slot_offset_type known_flush_pos_ = 0;
-  slot_offset_type unflushed_upper_bound_ = 0;
+  /** \brief The greatest lower bound of unflushed log data.  This is compared against the commit
+   * pos to see whether there is any unflushed data.
+   */
+  slot_offset_type unflushed_lower_bound_ = 0;
 
+  /** \brief The least upper bound of contiguous flushed data in the log.  Updates to this value
+   * should trigger an update of the control block.
+   */
+  slot_offset_type known_flush_pos_ = 0;
+
+  /** \brief The trailing aligned data page for the highest-offset pending flush operation.  This is
+   * used to avoid concurrently updating the same data page.
+   */
   Optional<SlotRange> flush_tail_;
 
+  /** \brief Set to true when we are re-writing the control block; used to avoid concurrent writes
+   * to the control block.
+   */
   bool writing_control_block_ = false;
 
+  /** \brief The current number of pending flush writes.  This does not include writing to the
+   * control block.
+   */
   usize writes_pending_ = 0;
+
+  /** \brief The maximum observed value of this->writes_pending_ (high water mark).
+   */
   usize writes_max_ = 0;
 
+  /** \brief Buffer containing the control block structure.
+   */
   std::unique_ptr<AlignedUnit[]> control_block_memory_;
 
   /** \brief The data buffer used to write updates to the control block; points at
@@ -585,8 +406,13 @@ class IoRingLogDriver2
    */
   std::vector<SlotRange> flushed_ranges_;
 
+  /** \brief A background task running the storage event loop.
+   */
   Optional<EventLoopTask> event_loop_task_;
 
+  /** \brief Used to make sure certain operations are race-free (i.e. they only happen on the event
+   * loop task thread).
+   */
   std::thread::id event_thread_id_;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
