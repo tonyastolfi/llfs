@@ -174,8 +174,8 @@ StatusOr<std::unique_ptr<PageAllocator>> recover_storage_object(
     const PageAllocatorRuntimeOptions& allocator_options,                       //
     const IoRingLogDriverOptions& log_options)
 {
-  StatusOr<std::unique_ptr<LogDeviceFactory>> log_factory = storage_context->recover_object(
-      batt::StaticType<PackedLogDeviceConfig>{}, p_allocator_config->log_device_uuid, log_options);
+  StatusOr<std::unique_ptr<LogDeviceFactory>> log_factory =
+      storage_context->recover_log_device(p_allocator_config->log_device_uuid, log_options);
 
   BATT_REQUIRE_OK(log_factory);
 

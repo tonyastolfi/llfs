@@ -53,6 +53,8 @@ inline Status IoRingLogDriver2<StorageT>::open() noexcept
   LLFS_VLOG(1) << "starting event loop";
 
   this->storage_.on_work_started();
+  this->work_started_.store(true);
+
   this->event_loop_task_.emplace(this->storage_, "IoRingLogDriver2::open()");
 
   BATT_REQUIRE_OK(this->read_control_block());
@@ -62,7 +64,7 @@ inline Status IoRingLogDriver2<StorageT>::open() noexcept
     LLFS_VLOG(1) << "initial event";
 
     this->event_thread_id_ = std::this_thread::get_id();
-    this->poll(this->observe(CommitPos{}), this->observe(TargetTrimPos{}));
+    this->poll();
   });
 
   return OkStatus();
@@ -84,12 +86,18 @@ inline Status IoRingLogDriver2<StorageT>::close()
 template <typename StorageT>
 inline void IoRingLogDriver2<StorageT>::halt()
 {
-  for (batt::Watch<llfs::slot_offset_type>& watch : this->observed_watch_) {
-    watch.close();
+  const bool previously_halted = this->halt_requested_.exchange(true);
+  if (!previously_halted) {
+    for (batt::Watch<llfs::slot_offset_type>& watch : this->observed_watch_) {
+      watch.close();
+    }
+    this->trim_pos_.close();
+    this->flush_pos_.close();
+
+    if (this->work_started_.exchange(false)) {
+      this->storage_.on_work_finished();
+    }
   }
-  this->trim_pos_.close();
-  this->flush_pos_.close();
-  this->storage_.on_work_finished();
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -125,7 +133,7 @@ inline Status IoRingLogDriver2<StorageT>::read_control_block()
   const slot_offset_type recovered_flush_pos = p_control_block->flush_pos;
 
   LLFS_VLOG(1) << BATT_INSPECT(recovered_trim_pos) << BATT_INSPECT(recovered_flush_pos)
-               << BATT_INSPECT(this->control_block_->generation);
+               << BATT_INSPECT(p_control_block->generation);
 
   LLFS_CHECK_SLOT_LE(recovered_trim_pos, recovered_flush_pos);
 
@@ -211,13 +219,18 @@ slot_offset_type IoRingLogDriver2<StorageT>::recover_flushed_commit_point() cons
 
   std::sort(sorted_commit_points.begin(), sorted_commit_points.end(), SlotOffsetOrder{});
 
-  auto iter = std::lower_bound(sorted_commit_points.begin(), sorted_commit_points.end(),
+  LLFS_VLOG(1) << BATT_INSPECT_RANGE(sorted_commit_points);
+
+  auto iter = std::upper_bound(sorted_commit_points.begin(), sorted_commit_points.end(),
                                recovered_flush_pos, SlotOffsetOrder{});
 
-  if (iter != sorted_commit_points.end()) {
+  if (iter != sorted_commit_points.begin()) {
+    --iter;
     slot_offset = slot_max(slot_offset, *iter);
+    LLFS_VLOG(1) << " -- using commit point: " << *iter;
   }
 
+  LLFS_CHECK_SLOT_LE(slot_offset, recovered_flush_pos);
   return slot_offset;
 }
 
@@ -320,10 +333,13 @@ void IoRingLogDriver2<StorageT>::reset_flush_pos(slot_offset_type new_flush_pos)
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 template <typename StorageT>
-inline void IoRingLogDriver2<StorageT>::poll(CommitPos observed_commit_pos,
-                                             TargetTrimPos observed_target_trim_pos) noexcept
+inline void IoRingLogDriver2<StorageT>::poll() noexcept
 {
-  LLFS_VLOG(1) << "poll(" << observed_commit_pos << ", " << observed_target_trim_pos << ")";
+  auto observed_commit_pos = this->observe(CommitPos{});
+  auto observed_target_trim_pos = this->observe(TargetTrimPos{});
+
+  LLFS_VLOG(1) << "poll()" << BATT_INSPECT(observed_commit_pos)
+               << BATT_INSPECT(observed_target_trim_pos);
 
   this->start_flush(observed_commit_pos);
   this->start_control_block_update(observed_target_trim_pos);
@@ -369,7 +385,7 @@ inline void IoRingLogDriver2<StorageT>::wait_for_slot_offset_change(T observed_v
                     return;
                   }
 
-                  this->poll(T{*new_value});
+                  this->poll();
                 }));
           }));
 }
@@ -550,7 +566,7 @@ inline void IoRingLogDriver2<StorageT>::handle_flush_write(const SlotRange& slot
 
   if (!result.ok()) {
     LLFS_VLOG(1) << "(handle_flush_write) error: " << result.status();
-    this->context_.update_error_status(result.status());
+    this->handle_write_error(result.status());
     return;
   }
 
@@ -571,7 +587,7 @@ inline void IoRingLogDriver2<StorageT>::handle_flush_write(const SlotRange& slot
     }
   }
 
-  this->poll(observed_commit_pos, this->observe(TargetTrimPos{}));
+  this->poll();
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -611,34 +627,45 @@ template <typename StorageT>
 void IoRingLogDriver2<StorageT>::start_control_block_update(
     slot_offset_type observed_target_trim_pos) noexcept
 {
-  if (this->writing_control_block_) {
+  if (this->writing_control_block_ || this->trim_pos_.is_closed() || this->flush_pos_.is_closed()) {
     return;
   }
 
   BATT_CHECK_NOT_NULLPTR(this->control_block_) << "Forgot to call read_control_block()?";
 
+  const slot_offset_type effective_target_trim_pos =
+      slot_min(this->known_flush_pos_, observed_target_trim_pos);
   const slot_offset_type observed_trim_pos = this->trim_pos_.get_value();
   const slot_offset_type observed_flush_pos = this->flush_pos_.get_value();
 
-  if (observed_trim_pos == observed_target_trim_pos &&
+  if (observed_trim_pos == effective_target_trim_pos &&
       observed_flush_pos == this->known_flush_pos_) {
     return;
   }
 
-  LLFS_VLOG(1) << "start_control_block_update():"                                    //
-               << " trim=" << observed_trim_pos << "->" << observed_target_trim_pos  //
+  LLFS_VLOG(1) << "start_control_block_update():"
+               << " trim=" << observed_trim_pos << "->" << observed_target_trim_pos
+               << " (effective=" << effective_target_trim_pos << ")"
                << " flush=" << observed_flush_pos << "->" << this->known_flush_pos_;
 
   BATT_CHECK_EQ(observed_trim_pos, this->control_block_->trim_pos);
   BATT_CHECK_EQ(observed_flush_pos, this->control_block_->flush_pos);
 
-  this->control_block_->commit_points[this->control_block_->next_commit_i] =
-      this->observe(CommitPos{});
+  const slot_offset_type latest_commit_pos = this->observe(CommitPos{});
+  auto& next_commit_pos_slot =
+      this->control_block_->commit_points[this->control_block_->next_commit_i];
 
-  this->control_block_->next_commit_i =
-      (this->control_block_->next_commit_i + 1) % this->control_block_->commit_points.size();
+  if (next_commit_pos_slot != latest_commit_pos) {
+    next_commit_pos_slot = latest_commit_pos;
 
-  this->control_block_->trim_pos = observed_target_trim_pos;
+    this->control_block_->next_commit_i =
+        (this->control_block_->next_commit_i + 1) % this->control_block_->commit_points.size();
+  }
+
+  LLFS_CHECK_SLOT_LE(effective_target_trim_pos, this->known_flush_pos_);
+  BATT_CHECK_LE(this->known_flush_pos_ - effective_target_trim_pos, this->config_.log_capacity);
+
+  this->control_block_->trim_pos = effective_target_trim_pos;
   this->control_block_->flush_pos = this->known_flush_pos_;
   this->control_block_->generation = this->control_block_->generation + 1;
 
@@ -663,7 +690,7 @@ void IoRingLogDriver2<StorageT>::handle_control_block_update(StatusOr<i32> resul
   this->writing_control_block_ = false;
 
   if (!result.ok()) {
-    this->context_.update_error_status(result.status());
+    this->handle_write_error(result.status());
     return;
   }
 
@@ -678,7 +705,17 @@ void IoRingLogDriver2<StorageT>::handle_control_block_update(StatusOr<i32> resul
   this->trim_pos_.set_value(this->control_block_->trim_pos);
   this->flush_pos_.set_value(this->control_block_->flush_pos);
 
-  this->poll(this->observe(CommitPos{}), this->observe(TargetTrimPos{}));
+  this->poll();
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+template <typename StorageT>
+void IoRingLogDriver2<StorageT>::handle_write_error(Status status) noexcept
+{
+  this->trim_pos_.close();
+  this->flush_pos_.close();
+  this->context_.update_error_status(status);
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -

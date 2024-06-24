@@ -117,15 +117,14 @@ StatusOr<std::unique_ptr<Volume>> recover_storage_object(
   StatusOr<batt::SharedPtr<PageCache>> page_cache = storage_context->get_page_cache();
   BATT_REQUIRE_OK(page_cache);
 
-  StatusOr<std::unique_ptr<LogDeviceFactory>> root_log_factory = storage_context->recover_object(
-      batt::StaticType<PackedLogDeviceConfig>{}, p_volume_config->root_log_uuid,
-      volume_runtime_options.root_log_options);
+  StatusOr<std::unique_ptr<LogDeviceFactory>> root_log_factory =
+      storage_context->recover_log_device(p_volume_config->root_log_uuid,
+                                          volume_runtime_options.root_log_options);
   BATT_REQUIRE_OK(root_log_factory);
 
   StatusOr<std::unique_ptr<LogDeviceFactory>> recycler_log_factory =
-      storage_context->recover_object(batt::StaticType<PackedLogDeviceConfig>{},
-                                      p_volume_config->recycler_log_uuid,
-                                      volume_runtime_options.recycler_log_options);
+      storage_context->recover_log_device(p_volume_config->recycler_log_uuid,
+                                          volume_runtime_options.recycler_log_options);
   BATT_REQUIRE_OK(recycler_log_factory);
 
   VolumeRecoverParams params{

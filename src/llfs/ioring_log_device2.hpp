@@ -189,23 +189,7 @@ class IoRingLogDriver2
    * - Starts updating the control block, if trim/flush are out of date
    * - Starts waiting for updates from the target trim and commit pos
    */
-  void poll(CommitPos observed_commit_pos, TargetTrimPos observed_target_trim_pos) noexcept;
-
-  /** \brief Convenience function - reads the commit_pos_ and then passes on
-   * `observed_target_trim_pos` to the 2-arg poll.
-   */
-  void poll(TargetTrimPos observed_target_trim_pos) noexcept
-  {
-    this->poll(this->observe(CommitPos{}), observed_target_trim_pos);
-  }
-
-  /** \brief Convenience function - reads the target_trim_pos_ and then passes on
-   * `observed_commit_pos` to the 2-arg poll.
-   */
-  void poll(CommitPos observed_commit_pos) noexcept
-  {
-    this->poll(observed_commit_pos, this->observe(TargetTrimPos{}));
-  }
+  void poll() noexcept;
 
   /** \brief Initiates an async wait on the specified watched value (either CommitPos or
    * TargetTrimPos), if there is not already a pending wait operation in progress.
@@ -276,6 +260,10 @@ class IoRingLogDriver2
    */
   void handle_control_block_update(StatusOr<i32> result) noexcept;
 
+  /** \brief Handles all write errors.
+   */
+  void handle_write_error(Status status) noexcept;
+
   /** \brief Returns a wrapped handler for async writes.
    *
    * Automatically injects `this` as the first arg to `handler`, so that callers need not capture
@@ -338,6 +326,14 @@ class IoRingLogDriver2
   /** \brief The absolute file (media) offset of the end (non-inclusive) of the data region.
    */
   i64 data_end_;
+
+  /** \brief True iff storage_.on_work_started() has been called (inside open).
+   */
+  std::atomic<bool> work_started_{false};
+
+  /** \brief True iff halt has been called.
+   */
+  std::atomic<bool> halt_requested_{false};
 
   /** \brief Stores the two externally modifiable Watch objects (target trim pos and commit pos).
    */
