@@ -21,10 +21,9 @@
 #include <llfs/packed_array.hpp>
 #include <llfs/packed_page_id.hpp>
 #include <llfs/packed_page_ref_count.hpp>
-#include <llfs/packed_pointer.hpp>
-#include <llfs/packed_slot_range.hpp>
 #include <llfs/packed_variant.hpp>
 #include <llfs/page_allocator_runtime_options.hpp>
+#include <llfs/page_size.hpp>
 #include <llfs/simple_packed_type.hpp>
 #include <llfs/slot_lock_manager.hpp>
 #include <llfs/slot_read_lock.hpp>
@@ -98,6 +97,8 @@ usize get_page_allocator_txn_grant_size(usize n_ref_counts);
 
 usize packed_sizeof_page_ref_count_slot() noexcept;
 
+usize packed_sizeof_page_allocator_attach_slot() noexcept;
+
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 
 class PageAllocatorState
@@ -110,11 +111,17 @@ class PageAllocatorState
   struct PageState {
     /** \brief The slot upper bound of the most recent update to this page.
      */
-    slot_offset_type last_update = 0;
+    slot_offset_type last_update;
 
     /** \brief The current reference count for the page.
      */
-    i32 ref_count = 0;
+    i32 ref_count;
+
+    /** \brief The current generation for the page; this is incremented when ref count goes from 1
+     * to 0, so when we recover a page with ref_count == 0, we can just use the given generation
+     * to populate the free pool.
+     */
+    page_generation_int generation;
   };
 
   struct AttachState {
@@ -130,16 +137,25 @@ class PageAllocatorState
 
     /** \brief The new trim offset (this is the slot upper bound of all checkpointed slots).
      */
-    slot_offset_type trim_target;
-
-    /** \brief The number of page ref count updates in all trimmed txn slots for this checkpoint.
-     */
-    u64 trimmed_txn_ref_count_updates;
+    slot_offset_type trim_target = 0;
   };
 
   //----- --- -- -  -  -   -
 
-  explicit PageAllocatorState(const PageIdFactory& page_ids) noexcept;
+  static const boost::uuids::uuid& get_event_entity(const PackedPageAllocatorAttach& event) noexcept
+  {
+    return event.user_id;
+  }
+
+  static PageId get_event_entity(const PackedPageRefCount& event) noexcept
+  {
+    return event.page_id.unpack();
+  }
+
+  //----- --- -- -  -  -   -
+
+  explicit PageAllocatorState(const PageIdFactory& page_ids,
+                              SlotLockManager* trim_control) noexcept;
 
   //----- --- -- -  -  -   -
 
@@ -148,6 +164,12 @@ class PageAllocatorState
   //  - one PackedPageRefCount slot for each PRC in each txn in the log
   //  - one attach/detach slot for each attached user_id
   //    (assumption: attach and detach are same size)
+
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
+  // Design Note:
+  //  PageAllocatorState::update is called for each slot on recovery and when each slot is
+  //  appended during normal operation (post-recovery).
+  //
 
   //----- --- -- -  -  -   -
 
@@ -159,26 +181,29 @@ class PageAllocatorState
   Status update_ref_count(slot_offset_type slot_upper_bound,
                           const PackedPageRefCount& pprc) noexcept;
 
-  bool ref_count_updated_since(slot_offset_type slot_upper_bound, PageId page_id) const noexcept;
+  /** \brief Returns true iff the ref count for `page_id` has not been updated/refreshed at a slot
+   * greater than `slot_upper_bound`.
+   */
+  bool updated_since(slot_offset_type slot_upper_bound, PageId page_id) const noexcept;
 
   /** \brief Returns true if `user_id` is attached and its `last_update` slot (upper bound) is
    * greater than `slot_upper_bound` *OR* if `user_id` is _not_ attached.
    */
-  bool attachment_updated_since(slot_offset_type slot_upper_bound,
-                                const boost::uuids::uuid& user_id) const noexcept;
+  bool updated_since(slot_offset_type slot_upper_bound,
+                     const boost::uuids::uuid& user_id) const noexcept;
+
+  PageState* get_page_state(PageId page_id) noexcept;
+
+  const PageState* get_page_state(PageId page_id) const noexcept;
 
   i32 get_ref_count(PageId page_id) const noexcept;
 
-  /** \brief Consumes as much of `grant` as possible in order to append multiple checkpoint slots as
-   * a single atomic MultiAppend.
+  /** \brief Consumes as much of `grant` as possible in order to append multiple checkpoint slots
+   * as a single atomic MultiAppend.
    */
   StatusOr<CheckpointInfo> append_checkpoint(
-      LogDevice& log_device, batt::Grant& grant,
+      LogDevice::Reader& log_reader, batt::Grant& grant,
       TypedSlotWriter<PackedPageAllocatorEvent>& slot_writer);
-
-  /** \brief Returns the target checkpoint grant size for the current log contents.
-   */
-  usize get_target_checkpoint_grant_size() const noexcept;
 
   //----- --- -- -  -  -   -
 
@@ -198,25 +223,23 @@ class PageAllocatorState
 
   std::vector<PageState> page_state;
 
-  usize active_txn_ref_counts = 0;
+  SlotLockManager* trim_control;
 };
-
-#if 0
 
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 //
 class PageAllocator
 {
  public:
-  static constexpr u64 kCheckpointGrantThreshold = 1 * kMiB;
+  static constexpr u64 kCheckpointTargetSize = 4 * kKiB;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
-  static u64 calculate_log_size(u64 physical_page_count, u64 max_attachments);
+  static u64 calculate_log_size(PageCount physical_page_count, MaxAttachments max_attachments);
 
   static StatusOr<std::unique_ptr<PageAllocator>> recover(
       const PageAllocatorRuntimeOptions& options, const PageIdFactory& page_ids,
-      u64 max_attachments, LogDeviceFactory& log_device_factory);
+      MaxAttachments max_attachments, LogDeviceFactory& log_device_factory);
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -328,6 +351,10 @@ class PageAllocator
    */
   void checkpoint_task_main() noexcept;
 
+  /** \brief Returns the target checkpoint grant pool size for the current configuration.
+   */
+  usize get_target_checkpoint_grant_pool_size() const noexcept;
+
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
   // Name for this object.
@@ -337,6 +364,10 @@ class PageAllocator
   // Contains the id and size of the associated PageDevice.
   //
   const PageIdFactory page_ids_;
+
+  // The maximum number of configured client attachments.
+  //
+  const u64 max_attachments_;
 
   // On recover, set to the number of attached users.  Attached users should call
   // `notify_user_recovered` to indicate that they are now in a clean state; when the last of
@@ -371,14 +402,20 @@ class PageAllocator
 
   // Grant used to append checkpoints.
   //
-  batt::Grant checkpoint_grant_;
+  batt::Grant checkpoint_grant_pool_;
+
+  // Grant used to append updates (attach/detach/txn).
+  //
+  batt::Grant update_grant_;
+
+  // Protects "live" slots against being trimmed before they are checkpointed.
+  //
+  SlotReadLock checkpoint_trim_lock_;
 
   // Background checkpoint task.
   //
   Optional<batt::Task> checkpoint_task_;
 };
-
-#endif
 
 }  //namespace experimental
 }  //namespace llfs

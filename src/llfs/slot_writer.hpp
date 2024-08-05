@@ -68,6 +68,15 @@ class SlotWriter
   //
   StatusOr<batt::Grant> reserve(u64 size, batt::WaitForResource wait_for_resource);
 
+  // Convenience.
+  //
+  batt::Grant reserve_or_panic(u64 size, batt::WaitForResource wait_for_resource)
+  {
+    StatusOr<batt::Grant> result = this->reserve(size, wait_for_resource);
+    BATT_CHECK_OK(result);
+    return std::move(*result);
+  }
+
   // Set the new log trim offset (i.e., lower bound of the valid range); return the number of bytes
   // trimmed.
   //
@@ -184,6 +193,13 @@ class SlotWriter::WriterLock
    * back everything since the most recent call to this->commit().
    */
   void cancel_all() noexcept;
+
+  /** \brief Returns the slot offset at which the lock was acquired.
+   */
+  slot_offset_type slot_offset() noexcept
+  {
+    return (**this->writer_lock_).slot_offset();
+  }
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
  private:
@@ -331,6 +347,13 @@ class TypedSlotWriter<PackedVariant<Ts...>> : public SlotWriter
                                  PostCommitFn&& post_commit_fn = {}) noexcept
     {
       return post_commit_fn(this->writer_lock_.commit(caller_grant));
+    }
+
+    /** \brief Returns the starting slot of the multi-append.
+     */
+    slot_offset_type slot_offset() noexcept
+    {
+      return this->writer_lock_.slot_offset();
     }
 
     //----- --- -- -  -  -   -

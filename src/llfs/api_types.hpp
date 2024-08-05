@@ -22,6 +22,8 @@ BATT_STRONG_TYPEDEF(usize, ThreadPoolSize);
 
 BATT_STRONG_TYPEDEF(usize, MaxQueueDepth);
 
+BATT_STRONG_TYPEDEF(usize, MaxAttachments);
+
 /*! \brief If set to true and the specified item/page is not found, then additional diagnostics will
  * be emitted (via logging).  Setting to false will suppress these diagnostics (as the application
  * has indicated that 'not found' is an expected/normal case for these calls).
