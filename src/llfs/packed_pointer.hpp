@@ -11,6 +11,7 @@
 #define LLFS_PACKED_POINTER_HPP
 
 #include <llfs/buffer.hpp>
+#include <llfs/define_packed_type.hpp>
 #include <llfs/int_types.hpp>
 
 #include <batteries/assert.hpp>
@@ -42,6 +43,7 @@ struct PackedPointer {
 
   const T* get() const
   {
+    static_assert(!is_self_contained_packed_type<PackedPointer<T, Offset>>());
     BATT_STATIC_ASSERT_EQ(sizeof(PackedPointer), sizeof(Offset));
 
     return reinterpret_cast<const T*>(reinterpret_cast<const u8*>(this) + this->offset);
@@ -50,6 +52,8 @@ struct PackedPointer {
   template <typename Dst>
   void reset(T* ptr, Dst* dst)
   {
+    static_assert(!is_self_contained_packed_type<PackedPointer<T, Offset>>());
+
     BATT_CHECK(dst->contains(this));
     BATT_CHECK(dst->contains(ptr)) << BATT_INSPECT((const void*)dst->buffer_begin())
                                    << BATT_INSPECT((const void*)dst->buffer_end())
@@ -85,7 +89,16 @@ struct PackedPointer {
       out << "} PackedPointer";
     };
   }
+
+  // +++++++++++-+-+--+----- --- -- -  -  -   -
 };
+
+#define LLFS_PACKED_POINTER_TYPE(type, offset) PackedPointer<type, offset>
+
+template <typename T, typename Offset>
+LLFS_IS_SELF_CONTAINED_PACKED_TYPE(LLFS_PACKED_POINTER_TYPE(T, Offset), false)
+
+#undef LLFS_PACKED_POINTER_TYPE
 
 //----- --- -- -  -  -   -
 template <typename U, typename O>

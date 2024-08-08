@@ -84,6 +84,8 @@ struct PackedBytes {
   }
 };
 
+static_assert(!is_self_contained_packed_type<PackedBytes>());
+
 BATT_STATIC_ASSERT_EQ(sizeof(PackedBytes), 8);
 
 inline std::string_view as_str(const PackedBytes* rec)

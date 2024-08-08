@@ -9,6 +9,8 @@
 #include <llfs/packed_page_ref_count.hpp>
 //
 
+#include <llfs/slot_writer.hpp>
+
 namespace llfs {
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -24,6 +26,14 @@ std::ostream& operator<<(std::ostream& out, const PackedPageRefCount& t)
   }
 
   return out << ",}";
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+usize packed_sizeof_page_ref_count_slot() noexcept
+{
+  constexpr usize kSize = packed_sizeof_slot_with_payload_size(sizeof(PackedPageRefCount));
+  return kSize;
 }
 
 }  // namespace llfs

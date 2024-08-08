@@ -11,6 +11,7 @@
 #define LLFS_PACKED_ARRAY_HPP
 
 #include <llfs/data_layout.hpp>
+#include <llfs/define_packed_type.hpp>
 #include <llfs/optional.hpp>
 #include <llfs/seq.hpp>
 
@@ -129,6 +130,10 @@ struct PackedArray {
   {
     return this->size_in_bytes;
   }
+
+  // +++++++++++-+-+--+----- --- -- -  -  -   -
+
+  static_assert(!is_self_contained_packed_type<PackedArray<T>>());
 };
 
 template <typename T>
@@ -160,21 +165,14 @@ batt::Status validate_packed_value(const PackedArray<T>& a, const void* buffer_d
   BATT_REQUIRE_OK(validate_packed_byte_range(&a, packed_array_size(a.size(), batt::StaticType<T>{}),
                                              buffer_data, buffer_size));
 
-  for (const auto& item : a) {
-    BATT_REQUIRE_OK(validate_packed_value(item, buffer_data, buffer_size));
+  // If T is a self-contained packed type, then it is sufficient to check the bounds of the array
+  // elements alone.  Otherwise, we must recursively check each element individually.
+  //
+  if (is_self_contained_packed_type<T>() == false) {
+    for (const auto& item : a) {
+      BATT_REQUIRE_OK(validate_packed_value(item, buffer_data, buffer_size));
+    }
   }
-
-  return batt::OkStatus();
-}
-
-template <boost::endian::order kOrder, typename T, usize kNBits>
-batt::Status validate_packed_value(
-    const PackedArray<boost::endian::endian_arithmetic<kOrder, T, kNBits>>& a,
-    const void* buffer_data, usize buffer_size)
-{
-  BATT_REQUIRE_OK(validate_packed_struct(a, buffer_data, buffer_size));
-  BATT_REQUIRE_OK(validate_packed_byte_range(&a, packed_array_size(a.size(), batt::StaticType<T>{}),
-                                             buffer_data, buffer_size));
 
   return batt::OkStatus();
 }

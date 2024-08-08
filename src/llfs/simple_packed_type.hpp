@@ -19,6 +19,8 @@
 #include <batteries/type_traits.hpp>
 
 #define LLFS_SIMPLE_PACKED_TYPE(type)                                                              \
+  LLFS_IS_SELF_CONTAINED_PACKED_TYPE(type, true)                                                   \
+                                                                                                   \
   inline ::llfs::usize packed_sizeof(const type&)                                                  \
   {                                                                                                \
     return ::llfs::packed_sizeof(::batt::StaticType<type>{});                                      \

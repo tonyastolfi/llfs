@@ -27,6 +27,8 @@ using PackedSlotRange = PackedInterval<PackedSlotOffset>;
 
 BATT_STATIC_ASSERT_EQ(sizeof(PackedSlotRange), 16);
 
+static_assert(is_self_contained_packed_type<PackedSlotRange>());
+
 }  // namespace llfs
 
 //#=##=##=#==#=#==#===#+==#+==========+==+=+=+=+=+=++=+++=+++++=-++++=-+++++++++++

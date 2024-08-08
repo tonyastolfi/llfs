@@ -88,6 +88,9 @@ struct PackedBasicInterval {
   }
 };
 
+template <typename Traits>
+LLFS_IS_SELF_CONTAINED_PACKED_TYPE(PackedBasicInterval<Traits>, true)
+
 /** \brief Returns the packed size of the given interval.
  */
 template <typename Traits>

@@ -40,6 +40,12 @@ template <typename T>
 using UnpackedTypeFor = batt::RemoveStatusOr<decltype(unpack_object(std::declval<const T&>(),
                                                                     std::declval<DataReader*>()))>;
 
+template <typename T>
+inline constexpr bool is_self_contained_packed_type(batt::StaticType<T> static_type = {})
+{
+  return llfs_is_self_contained_packed_type(static_type);
+}
+
 }  // namespace llfs
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -53,6 +59,13 @@ using UnpackedTypeFor = batt::RemoveStatusOr<decltype(unpack_object(std::declval
   [[maybe_unused]] static inline constexpr int BOOST_PP_CAT(                                       \
       Suppress_Warning_About_Extra_Semicolon_After_LLFS_DEFINE_PACKED_TYPE_FOR_,                   \
       BOOST_PP_CAT(__COUNTER__, BOOST_PP_CAT(_, __LINE__))) = 0
+
+#define LLFS_IS_SELF_CONTAINED_PACKED_TYPE(type, value)                                            \
+  [[maybe_unused]] inline constexpr bool llfs_is_self_contained_packed_type(                       \
+      ::batt::StaticType<type>)                                                                    \
+  {                                                                                                \
+    return (value);                                                                                \
+  }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -70,6 +83,14 @@ inline StaticType<void> llfs_packed_type_for(StaticType<void>)
   return {};
 }
 
+template <typename T>
+inline constexpr bool llfs_is_self_contained_packed_type(StaticType<T> = {})
+{
+  return false;
+}
+
 }  // namespace batt
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 
 #endif  // LLFS_DEFINE_PACKED_TYPE_HPP

@@ -14,8 +14,10 @@
 #include <llfs/optional.hpp>
 
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <ostream>
+#include <random>
 
 namespace llfs {
 
@@ -126,6 +128,14 @@ inline page_id_int get_page_id_int(const PageId& id)
 inline page_id_int get_page_id_int(const NoneType&)
 {
   return kInvalidPageId;
+}
+
+template <typename Rng>
+PageId make_random_page_id(Rng& rng)
+{
+  std::uniform_int_distribution<llfs::page_id_int> pick_page_id_int{
+      std::numeric_limits<page_id_int>::min(), std::numeric_limits<page_id_int>::max()};
+  return PageId{pick_page_id_int(rng)};
 }
 
 }  // namespace llfs

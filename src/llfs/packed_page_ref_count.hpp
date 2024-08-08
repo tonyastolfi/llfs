@@ -16,6 +16,7 @@
 #include <llfs/int_types.hpp>
 #include <llfs/packed_page_id.hpp>
 #include <llfs/page_ref_count.hpp>
+#include <llfs/unpack_cast.hpp>
 
 namespace llfs {
 
@@ -42,6 +43,10 @@ BATT_STATIC_ASSERT_EQ(sizeof(PackedPageRefCount), 12);
 LLFS_DEFINE_PACKED_TYPE_FOR(PageRefCount, PackedPageRefCount);
 LLFS_DEFINE_PACKED_TYPE_FOR(PackedPageRefCount, PackedPageRefCount);
 
+LLFS_IS_SELF_CONTAINED_PACKED_TYPE(PackedPageRefCount, true)
+
+static_assert(is_self_contained_packed_type<PackedPageRefCount>());
+
 std::ostream& operator<<(std::ostream& out, const PackedPageRefCount& t);
 
 inline usize packed_sizeof(const PackedPageRefCount&)
@@ -63,6 +68,17 @@ template <typename Dst>
   *to = from;
   return true;
 }
+
+inline Status validate_packed_value(const PackedPageRefCount& pprc, const void* buffer_data,
+                                    usize buffer_size)
+{
+  return validate_packed_struct(pprc, buffer_data, buffer_size);
+}
+
+/** \brief Returns the size (in bytes) of a packed page ref count slot (assuming PackedPageRefCount
+ * is a member of the top-level event variant for the target log).
+ */
+usize packed_sizeof_page_ref_count_slot() noexcept;
 
 }  // namespace llfs
 

@@ -382,6 +382,17 @@ class TypedSlotWriter<PackedVariant<Ts...>> : public SlotWriter
     //
     MultiAppend op{*this};
 
+    return this->typed_append(op, caller_grant, BATT_FORWARD(payload),
+                              BATT_FORWARD(post_commit_fn));
+  }
+
+  template <typename T, typename PackedT = PackedTypeFor<T>,
+            typename PostCommitFn = NullPostCommitFn>
+  StatusOr<SlotParseWithPayload<const PackedT*>> typed_append(MultiAppend& op,
+                                                              batt::Grant& caller_grant,
+                                                              T&& payload,
+                                                              PostCommitFn&& post_commit_fn = {})
+  {
     StatusOr<SlotParseWithPayload<const PackedT*>> result =
         op.typed_append(caller_grant, BATT_FORWARD(payload));
 

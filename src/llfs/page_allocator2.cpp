@@ -15,6 +15,10 @@
 namespace llfs {
 namespace experimental {
 
+static_assert(!is_self_contained_packed_type<PackedPageAllocatorTxn>());
+static_assert(is_self_contained_packed_type<PackedPageAllocatorAttach>());
+static_assert(is_self_contained_packed_type<PackedPageAllocatorDetach>());
+
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 std::ostream& operator<<(std::ostream& out, const PackedPageAllocatorAttach& t)
@@ -31,10 +35,49 @@ std::ostream& operator<<(std::ostream& out, const PackedPageAllocatorDetach& t)
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
+std::ostream& operator<<(std::ostream& out, const PageAllocatorTxn& t)
+{
+  return out << "PageAllocatorTxn{.user_id=" << t.user_id << ", .user_slot=" << t.user_slot
+             << ", .ref_counts=" << batt::dump_range(t.ref_counts) << ",}";
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
 std::ostream& operator<<(std::ostream& out, const PackedPageAllocatorTxn& t)
 {
   return out << "PackedPageAllocatorTxn{.user_id=" << t.user_id << ", .user_slot=" << t.user_slot
              << ", .ref_counts=" << batt::dump_range(t.ref_counts) << ",}";
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+PackedPageAllocatorTxn* pack_object_to(const PageAllocatorTxn& from, PackedPageAllocatorTxn* to,
+                                       DataPacker* dst)
+{
+  to->user_id = from.user_id;
+  to->user_slot = from.user_slot;
+  to->ref_counts.initialize(0);
+
+  BasicArrayPacker<PackedPageRefCount, DataPacker> packed_ref_counts{&to->ref_counts, dst};
+
+  for (const PageRefCount& prc : from.ref_counts) {
+    if (!packed_ref_counts.pack_item(prc)) {
+      return nullptr;
+    }
+  }
+
+  return to;
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+Status validate_packed_value(const PackedPageAllocatorTxn& txn, const void* buffer_data,
+                             usize buffer_size)
+{
+  BATT_REQUIRE_OK(validate_packed_struct(txn, buffer_data, buffer_size));
+  BATT_REQUIRE_OK(validate_packed_value(txn.ref_counts, buffer_data, buffer_size));
+
+  return OkStatus();
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -46,17 +89,16 @@ usize packed_sizeof_page_allocator_txn(usize n_ref_counts)
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-usize packed_sizeof(const PackedPageAllocatorTxn& txn)
+usize packed_sizeof(const PageAllocatorTxn& txn)
 {
   return packed_sizeof_page_allocator_txn(txn.ref_counts.size());
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-usize packed_sizeof_page_ref_count_slot() noexcept
+usize packed_sizeof(const PackedPageAllocatorTxn& txn)
 {
-  static const usize size_ = packed_sizeof_slot_with_payload_size(sizeof(PackedPageRefCount));
-  return size_;
+  return packed_sizeof_page_allocator_txn(txn.ref_counts.size());
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -66,14 +108,6 @@ usize packed_sizeof_page_allocator_attach_slot() noexcept
   static const usize size_ =
       packed_sizeof_slot_with_payload_size(sizeof(PackedPageAllocatorAttach));
   return size_;
-}
-
-//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-//
-usize get_page_allocator_txn_grant_size(usize n_ref_counts)
-{
-  return packed_sizeof_slot_with_payload_size(packed_sizeof_page_allocator_txn(n_ref_counts)) +
-         n_ref_counts * packed_sizeof_page_ref_count_slot();
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -279,7 +313,11 @@ StatusOr<PageAllocatorState::CheckpointInfo> PageAllocatorState::append_checkpoi
         multi_append.typed_append(grant, event);
 
     if (!new_slot.ok()) {
-      return batt::StatusCode::kLoopBreak;
+      if (new_slot.status() == ::llfs::make_status(StatusCode::kSlotGrantTooSmall)) {
+        return batt::StatusCode::kLoopBreak;
+      } else {
+        return new_slot.status();
+      }
     }
 
     return this->update(new_slot->slot, *new_slot->payload);
@@ -321,7 +359,102 @@ StatusOr<PageAllocatorState::CheckpointInfo> PageAllocatorState::append_checkpoi
   BATT_REQUIRE_OK(result);
   BATT_ASSIGN_OK_RESULT(info.checkpoint_slots, multi_append.finalize(grant));
 
-  return {info};
+  return info;
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+Status PageAllocatorState::validate_and_apply_ref_count_deltas(
+    const Slice<PageRefCount>& ref_count_updates) const noexcept
+{
+  // TODO [tastolfi 2024-08-08] Change all status codes below to unique codes (add to
+  // llfs::StatusCode).
+
+  const u64 physical_page_count = this->page_ids.get_physical_page_count();
+
+  for (PageRefCount& prc : ref_count_updates) {
+    // If the delta is zero then this should have been filtered out.
+    //
+    if (prc.ref_count == 0) {
+      return batt::StatusCode::kInvalidArgument;
+    }
+
+    // Sanity check: make sure device id matches.
+    //
+    if (this->page_ids.get_device_id(prc.page_id) != this->page_ids.get_device_id()) {
+      return batt::StatusCode::kInvalidArgument;
+    }
+
+    // Validate that the physical page is in range.
+    //
+    const u64 physical_page = this->page_ids.get_physical_page(prc.page_id);
+    if (physical_page >= physical_page_count) {
+      return batt::StatusCode::kOutOfRange;
+    }
+
+    // Retrieve the current state.
+    //
+    const PageState& old_state = this->page_state[physical_page];
+    BATT_CHECK_GE(old_state.ref_count, 0) << "The ref count of a page must never be negative!";
+
+    // Validate the page generation.
+    //
+    const page_generation_int old_generation = this->page_ids.get_generation(prc.page_id);
+    if (old_generation != old_state.generation) {
+      return batt::StatusCode::kInvalidArgument;
+    }
+
+    // Handle two high level cases: ref_count == 1 and ref_count != 1.  This is equivalent to
+    // whether prc.ref_count (update delta) is equal to kRefCount_1_to_0; i.e.,
+    //   (prc.ref_count == kRefCount_1_to_0) == (old_state.ref_count == 1)
+    //
+    if (prc.ref_count == kRefCount_1_to_0) {
+      if (old_state.ref_count != 1) {
+        return batt::StatusCode::kFailedPrecondition;
+      }
+
+      // If dropping the page, we must advance the generation of the page_id.
+      //
+      const page_generation_int new_generation = old_generation + 1;
+
+      prc.page_id = this->page_ids.make_page_id(physical_page, new_generation);
+      prc.ref_count = 0;
+
+    } else {
+      // kRefCount_1_to_0 is the only allowed update once the ref count has become 1.
+      //
+      if (old_state.ref_count == 1) {
+        return batt::StatusCode::kFailedPrecondition;
+      }
+
+      const i32 new_ref_count = old_state.ref_count + prc.ref_count;
+
+      if (prc.ref_count > 0) {
+        BATT_CHECK_GT(new_ref_count, old_state.ref_count)
+            << "Integer wrap detected:" << BATT_INSPECT(prc);
+
+        // When first writing a new page, we must increase ref count by at least 2.
+        //
+        if (old_state.ref_count == 0 && new_ref_count < 2) {
+          return batt::StatusCode::kInvalidArgument;
+        }
+
+      } else {
+        BATT_CHECK_LT(new_ref_count, old_state.ref_count)
+            << "Integer wrap detected:" << BATT_INSPECT(prc);
+
+        // We must never go from above 1 to below 1 in a single update.
+        //
+        if (new_ref_count < 1) {
+          return batt::StatusCode::kInvalidArgument;
+        }
+      }
+
+      prc.ref_count = new_ref_count;
+    }
+  }
+
+  return OkStatus();
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -574,20 +707,23 @@ void PageAllocator::start_checkpoint_task(batt::TaskScheduler& scheduler)
 void PageAllocator::checkpoint_task_main() noexcept
 {
   Status status = [&]() -> Status {
+    const usize target_checkpoint_grant_pool_size = this->get_target_checkpoint_grant_pool_size();
+
     for (;;) {
       // Wait for new slots to be appended.
       //
       std::unique_ptr<LogDevice::Reader> log_reader =
           this->log_device_->new_reader(/*slot_lower_bound=*/None, LogReadMode::kSpeculative);
 
-      BATT_REQUIRE_OK(
-          log_reader->await(BytesAvailable{.size = this->get_target_checkpoint_grant_pool_size() +
-                                                   PageAllocator::kCheckpointTargetSize}));
+      BATT_REQUIRE_OK(log_reader->await(BytesAvailable{
+          .size = target_checkpoint_grant_pool_size + PageAllocator::kCheckpointTargetSize,
+      }));
 
       // Spend some of the checkpoint grant pool to write new checkpoints.
       //
       StatusOr<batt::Grant> checkpoint_grant = this->checkpoint_grant_pool_.spend(
           PageAllocator::kCheckpointTargetSize, batt::WaitForResource::kFalse);
+
       BATT_REQUIRE_OK(checkpoint_grant);
 
       // Append checkpoint slots to the log.
@@ -597,6 +733,7 @@ void PageAllocator::checkpoint_task_main() noexcept
 
         return locked_state->append_checkpoint(*log_reader, *checkpoint_grant, this->slot_writer_);
       }();
+
       BATT_REQUIRE_OK(checkpoint_info);
 
       // Return the unused grant to the pool.
@@ -640,9 +777,9 @@ void PageAllocator::checkpoint_task_main() noexcept
 
         // Refill grants.
         //
-        if (this->checkpoint_grant_pool_.size() > this->get_target_checkpoint_grant_pool_size()) {
+        if (this->checkpoint_grant_pool_.size() > target_checkpoint_grant_pool_size) {
           const u64 surplus =
-              this->checkpoint_grant_pool_.size() - this->get_target_checkpoint_grant_pool_size();
+              this->checkpoint_grant_pool_.size() - target_checkpoint_grant_pool_size;
 
           batt::Grant grant = BATT_OK_RESULT_OR_PANIC(
               this->checkpoint_grant_pool_.spend(surplus, batt::WaitForResource::kFalse));
@@ -652,7 +789,7 @@ void PageAllocator::checkpoint_task_main() noexcept
 
         } else {
           const u64 deficit =
-              this->get_target_checkpoint_grant_pool_size() - this->checkpoint_grant_pool_.size();
+              target_checkpoint_grant_pool_size - this->checkpoint_grant_pool_.size();
 
           if (deficit == 0) {
             break;

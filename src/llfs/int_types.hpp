@@ -236,4 +236,44 @@ inline usize packed_sizeof(little_i64)
 
 }  // namespace llfs
 
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+
+namespace boost {
+namespace endian {
+
+#define LLFS_BOOST_ENDIAN_ARITHMETIC(order, type, nbits)                                           \
+  boost::endian::endian_arithmetic<order, type, nbits>
+
+template <boost::endian::order kOrder, typename T, std::size_t kNBits>
+LLFS_IS_SELF_CONTAINED_PACKED_TYPE(LLFS_BOOST_ENDIAN_ARITHMETIC(kOrder, T, kNBits), true)
+
+#undef LLFS_BOOST_ENDIAN_ARITHMETIC
+
+}  // namespace endian
+}  // namespace boost
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+
+namespace llfs {
+
+static_assert(is_self_contained_packed_type<little_u8>());
+static_assert(is_self_contained_packed_type<little_i8>());
+static_assert(is_self_contained_packed_type<little_u16>());
+static_assert(is_self_contained_packed_type<little_i16>());
+static_assert(is_self_contained_packed_type<little_u32>());
+static_assert(is_self_contained_packed_type<little_i32>());
+static_assert(is_self_contained_packed_type<little_u64>());
+static_assert(is_self_contained_packed_type<little_i64>());
+
+static_assert(is_self_contained_packed_type<big_u8>());
+static_assert(is_self_contained_packed_type<big_i8>());
+static_assert(is_self_contained_packed_type<big_u16>());
+static_assert(is_self_contained_packed_type<big_i16>());
+static_assert(is_self_contained_packed_type<big_u32>());
+static_assert(is_self_contained_packed_type<big_i32>());
+static_assert(is_self_contained_packed_type<big_u64>());
+static_assert(is_self_contained_packed_type<big_i64>());
+
+}  //namespace llfs
+
 #endif  // LLFS_INT_TYPES_HPP

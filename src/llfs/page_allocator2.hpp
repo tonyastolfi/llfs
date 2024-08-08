@@ -78,7 +78,27 @@ LLFS_SIMPLE_PACKED_TYPE(PackedPageAllocatorDetach);
 std::ostream& operator<<(std::ostream& out, const PackedPageAllocatorDetach& t);
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-//
+// PageAllocator Txn
+
+usize packed_sizeof_page_allocator_txn(usize n_ref_counts);
+
+struct PageAllocatorTxn {
+  boost::uuids::uuid user_id;
+  slot_offset_type user_slot;
+  Slice<const PageRefCount> ref_counts;
+};
+
+std::ostream& operator<<(std::ostream& out, const PageAllocatorTxn& t);
+
+LLFS_DEFINE_PACKED_TYPE_FOR(PageAllocatorTxn, PackedPageAllocatorTxn);
+
+PackedPageAllocatorTxn* pack_object_to(const PageAllocatorTxn& from, PackedPageAllocatorTxn* to,
+                                       DataPacker* dst);
+
+usize packed_sizeof(const PageAllocatorTxn& txn);
+
+//+++++++++++-+-+--+----- --- -- -  -  -   -
+
 struct PackedPageAllocatorTxn {
   boost::uuids::uuid user_id;                  // 16
   PackedSlotOffset user_slot;                  // 8
@@ -87,15 +107,16 @@ struct PackedPageAllocatorTxn {
 
 BATT_STATIC_ASSERT_EQ(sizeof(PackedPageAllocatorTxn), 32);
 
-std::ostream& operator<<(std::ostream& out, const PackedPageAllocatorTxn& t);
+LLFS_IS_SELF_CONTAINED_PACKED_TYPE(PackedPageAllocatorTxn, false);
 
-usize packed_sizeof_page_allocator_txn(usize n_ref_counts);
+std::ostream& operator<<(std::ostream& out, const PackedPageAllocatorTxn& t);
 
 usize packed_sizeof(const PackedPageAllocatorTxn& txn);
 
-usize get_page_allocator_txn_grant_size(usize n_ref_counts);
+Status validate_packed_value(const PackedPageAllocatorTxn& txn, const void* buffer_data,
+                             usize buffer_size);
 
-usize packed_sizeof_page_ref_count_slot() noexcept;
+//=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 
 usize packed_sizeof_page_allocator_attach_slot() noexcept;
 
@@ -198,12 +219,27 @@ class PageAllocatorState
 
   i32 get_ref_count(PageId page_id) const noexcept;
 
+  /** \brief Returns true if the given `user_id` is attached.
+   */
+  bool is_user_attached(const boost::uuids::uuid& user_id) const noexcept
+  {
+    return this->attach_state.count(user_id) != 0;
+  }
+
   /** \brief Consumes as much of `grant` as possible in order to append multiple checkpoint slots
    * as a single atomic MultiAppend.
    */
   StatusOr<CheckpointInfo> append_checkpoint(
       LogDevice::Reader& log_reader, batt::Grant& grant,
       TypedSlotWriter<PackedPageAllocatorEvent>& slot_writer);
+
+  /** \brief Validates the passed list of PageRefCount delta updates, transforming the passed array
+   * into the new absolute values of their respective page ref counts. NOTE: despite the word
+   * 'apply' in the function name, this function does not modify the current page states (that is
+   * done by update()).
+   */
+  Status validate_and_apply_ref_count_deltas(
+      const Slice<PageRefCount>& ref_count_updates) const noexcept;
 
   //----- --- -- -  -  -   -
 
@@ -416,6 +452,116 @@ class PageAllocator
   //
   Optional<batt::Task> checkpoint_task_;
 };
+
+//#=##=##=#==#=#==#===#+==#+==========+==+=+=+=+=+=++=+++=+++++=-++++=-+++++++++++
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+template <typename PageRefCountSeq,  //
+          typename GarbageCollectFn>
+inline StatusOr<SlotReadLock> PageAllocator::update_page_ref_counts(
+    const boost::uuids::uuid& user_id,    //
+    slot_offset_type user_slot,           //
+    PageRefCountSeq&& ref_count_updates,  //
+    GarbageCollectFn&& garbage_collect_fn)
+{
+  //----- --- -- -  -  -   -
+  // Summary:
+  //  1. Copy ref count updates to a local vector (for relative-to-absolute conversion)
+  //  2. Wait until we can reserve enough grant to append the Txn slot
+  //  3. Lock the state mutex and:
+  //     1. Verify that `user_id` is attached
+  //     2. Calculate relative-to-absolute ref counts
+  //     3. Acquire a SlotReadLock for the txn
+  //     4. Append the txn slot
+  //     5. Update ref counts in state
+  //  4. Call passed garbage_collect_fn for all dead pages (ref_count == 1 due to this txn)
+  //----- --- -- -  -  -   -
+
+  SlotReadLock txn_slot_lock;
+  batt::SmallVec<PageRefCount, 256> new_ref_counts;
+
+  // 1. First copy the ref count _deltas_ to the local tmp vector; we will change them from relative
+  //    deltas to new absolute counts later.
+  //
+  BATT_FORWARD(ref_count_updates) | seq::emplace_back(&new_ref_counts);
+
+  // 2. Reserve grant from the `update_grant_` pool; this is replentished from our background
+  //   (checkpoint) task, once it is confident it has enough grant for checkpoints (which take
+  //   priority over updates).
+  //
+  const usize payload_size = packed_sizeof_page_allocator_txn(new_ref_counts.size());
+  const usize slot_size = packed_sizeof_slot_with_payload_size(payload_size);
+
+  BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant,
+                        this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue));
+
+  // 3. Lock the State and process the txn.
+  //
+  {
+    batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+    // 3.1. The specified user must be attached.
+    //
+    if (!locked_state->is_user_attached(user_id)) {
+      return {::llfs::make_status(::llfs::StatusCode::kPageAllocatorNotAttached)};
+    }
+
+    // 3.2. Convert local vector `new_ref_counts` from deltas to new ref_count absolute values.
+    //
+    BATT_REQUIRE_OK(locked_state->validate_and_apply_ref_count_deltas(as_slice(new_ref_counts)));
+
+    // Create the op explicitly so we know the slot range before appending.
+    //
+    TypedSlotWriter<PackedPageAllocatorEvent>::MultiAppend append_op{this->slot_writer_};
+
+    SlotRange slot_range;
+
+    slot_range.lower_bound = append_op.slot_offset();
+    slot_range.upper_bound = slot_range.lower_bound + slot_size;
+
+    // 3.3. Lock the range of this slot before appending it, to be absolutely certain it can't be
+    // trimmed!
+    //
+    BATT_ASSIGN_OK_RESULT(txn_slot_lock, this->trim_control_->lock_slots(
+                                             slot_range, "PageAllocator::update_page_ref_counts"));
+
+    // 3.4. Pack the txn into a new slot and append to the log.
+    //
+    StatusOr<SlotParseWithPayload<const PackedPageAllocatorTxn*>> packed_slot =
+        this->slot_writer_.typed_append(append_op, slot_grant,
+                                        PageAllocatorTxn{
+                                            .user_id = user_id,
+                                            .user_slot = user_slot,
+                                            .ref_counts = as_slice(new_ref_counts),
+                                        });
+
+    BATT_REQUIRE_OK(packed_slot);
+
+    // Make sure that the slot range calculation we did above was accurate.
+    //
+    BATT_CHECK_EQ(slot_range, packed_slot->slot.offset);
+
+    // 3.5. Update the state before releasing mutex.
+    //
+    BATT_CHECK_OK(locked_state->update(packed_slot->slot, *packed_slot->payload))
+        << "This should never fail!";
+  }
+  //
+  // (unlock State)
+
+  // 4. Finally, call the garbage collection function for all newly dead pages.
+  //
+  for (const PageRefCount& prc : new_ref_counts) {
+    if (prc.ref_count == 1) {
+      garbage_collect_fn(prc.page_id);
+    }
+  }
+
+  // Done; return the slot lock.
+  //
+  return txn_slot_lock;
+}
 
 }  //namespace experimental
 }  //namespace llfs
