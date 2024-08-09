@@ -373,6 +373,11 @@ class PageAllocator
    */
   StatusOr<i32> get_ref_count(PageId page_id);
 
+  /** \brief Returns the current PageId (which includes the current generation number and device id)
+   * and ref count for the given physical page.
+   */
+  StatusOr<PageRefCount> get_ref_count(PhysicalPageId physical_page);
+
   //+++++++++++-+-+--+----- --- -- -  -  -   -
  private:
   //+++++++++++-+-+--+----- --- -- -  -  -   -

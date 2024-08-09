@@ -901,6 +901,28 @@ StatusOr<i32> PageAllocator::get_ref_count(PageId page_id)
   }
 }
 
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+StatusOr<PageRefCount> PageAllocator::get_ref_count(PhysicalPageId physical_page)
+{
+  const u64 physical_page_count = this->page_ids_.get_physical_page_count();
+
+  if (physical_page >= physical_page_count) {
+    return {batt::StatusCode::kOutOfRange};
+  }
+
+  {
+    batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+    const PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
+
+    return PageRefCount{
+        .page_id = this->page_ids_.make_page_id(physical_page, page_state.generation),
+        .ref_count = page_state.ref_count,
+    };
+  }
+}
+
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 // private
 

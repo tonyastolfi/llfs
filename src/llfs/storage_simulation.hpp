@@ -126,6 +126,14 @@ class StorageSimulation
    */
   batt::TaskScheduler& task_scheduler() noexcept;
 
+  /** \brief Convenience: invokes this->task_scheduler().schedule_task() and returns the resulting
+   * executor.
+   */
+  boost::asio::any_io_executor schedule_task() noexcept
+  {
+    return this->task_scheduler().schedule_task();
+  }
+
   /** \brief Returns a reference to the entropy source passed in at construction time.
    */
   batt::StateMachineEntropySource& entropy_source() noexcept

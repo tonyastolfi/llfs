@@ -35,6 +35,9 @@ constexpr u8 kPageDeviceIdShift = 64 - kPageDeviceIdBits;
 constexpr page_id_int kPageDeviceIdMask = ((page_id_int{1} << kPageDeviceIdBits) - 1)
                                           << kPageDeviceIdShift;
 
+BATT_STRONG_TYPEDEF(page_id_int, PhysicalPageId);
+BATT_STRONG_TYPEDEF(page_generation_int, PageGeneration);
+
 // Utility class to construct/deconstruct page ids from device id, physical page number, and page
 // generation.
 //
