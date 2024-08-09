@@ -35,6 +35,7 @@
 #include <batteries/async/task.hpp>
 #include <batteries/async/watch.hpp>
 
+#include <boost/dynamic_bitset.hpp>
 #include <boost/lockfree/stack.hpp>
 
 namespace llfs {
@@ -129,6 +130,11 @@ class PageAllocatorState
 
   //----- --- -- -  -  -   -
 
+  struct UserRecoveryState {
+    bool recovery_started = false;
+    std::map<slot_offset_type, SlotReadLock> pending_txns;
+  };
+
   struct PageState {
     /** \brief The slot upper bound of the most recent update to this page.
      */
@@ -219,6 +225,8 @@ class PageAllocatorState
 
   i32 get_ref_count(PageId page_id) const noexcept;
 
+  Status validate_page_id(PageId page_id) const noexcept;
+
   /** \brief Returns true if the given `user_id` is attached.
    */
   bool is_user_attached(const boost::uuids::uuid& user_id) const noexcept
@@ -251,8 +259,7 @@ class PageAllocatorState
    */
   bool in_recovery_mode;
 
-  std::unordered_map<boost::uuids::uuid, std::map<slot_offset_type, SlotReadLock>,
-                     boost::hash<boost::uuids::uuid>>
+  std::unordered_map<boost::uuids::uuid, UserRecoveryState, boost::hash<boost::uuids::uuid>>
       pending_recovery;
 
   std::unordered_map<boost::uuids::uuid, AttachState, boost::hash<boost::uuids::uuid>> attach_state;
@@ -283,6 +290,16 @@ class PageAllocator
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
+  /** \brief Requests shutdown of all background tasks for this PageAllocator.
+   */
+  void halt() noexcept;
+
+  /** \brief Blocks until all background tasks have completed.
+   */
+  void join() noexcept;
+
+  //----- --- -- -  -  -   -
+
   /** \brief First stage of per-user recovery; retrieves the list of recovered transactions
    * belonging to this user.  The user must call `notify_user_recovered` when it has finished all
    * recovery activities.
@@ -296,15 +313,12 @@ class PageAllocator
    */
   Status notify_user_recovered(const boost::uuids::uuid& user_id);
 
-  //----- --- -- -  -  -   -
-
-  /** \brief Requests shutdown of all background tasks for this PageAllocator.
+  /** \brief Blocks the caller until all users have completed recovery of any pending txns.
+   *
+   * Note: all attached users *must* at least ask for pending txns and notify the allocator that
+   * they are done in order for this process to complete.
    */
-  void halt() noexcept;
-
-  /** \brief Blocks until all background tasks have completed.
-   */
-  void join() noexcept;
+  Status require_users_recovered(batt::WaitForResource wait_for_resource);
 
   //----- --- -- -  -  -   -
 
@@ -372,9 +386,9 @@ class PageAllocator
   /** \brief Implements PageAllocator state recovery.  Must be called by PageAllocator::recover
    * prior to returning the PageAllocator pointer.
    *
-   * \return The compacted slot upper bound
+   * \return The recovered slot range.
    */
-  Status recover_impl();
+  StatusOr<SlotRange> recover_impl();
 
   /** \brief Starts the compaction task; must be called after recovery.
    */
@@ -390,6 +404,21 @@ class PageAllocator
   /** \brief Returns the target checkpoint grant pool size for the current configuration.
    */
   usize get_target_checkpoint_grant_pool_size() const noexcept;
+
+  /** \brief Common implementation for attach_user and detach_user.
+   */
+  template <typename AttachEventT>
+  StatusOr<slot_offset_type> process_attach_event(const AttachEventT& event);
+
+  /** \brief Starts the free page task; see free_page_task_main() for details.
+   */
+  void start_free_page_task(batt::TaskScheduler& scheduler,
+                            slot_offset_type recovered_slot_upper_bound);
+
+  /** \brief Runs in the background, scanning durable log segments looking for newly freed pages to
+   * replentish the free page pool.
+   */
+  void free_page_task_main(slot_offset_type recovered_slot_upper_bound) noexcept;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -451,6 +480,14 @@ class PageAllocator
   // Background checkpoint task.
   //
   Optional<batt::Task> checkpoint_task_;
+
+  // Bitset that tracks which pages are durably known to be in use (1) or free (0).
+  //
+  boost::dynamic_bitset<> durable_page_in_use_;
+
+  // Background free page task.
+  //
+  Optional<batt::Task> free_page_task_;
 };
 
 //#=##=##=#==#=#==#===#+==#+==========+==+=+=+=+=+=++=+++=+++++=-++++=-+++++++++++
@@ -495,6 +532,13 @@ inline StatusOr<SlotReadLock> PageAllocator::update_page_ref_counts(
 
   BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant,
                         this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue));
+
+  // This should be a no-op, but make sure we return the slot grant to the update grant pool and not
+  // the default log pool maintained by the slot writer.
+  //
+  auto on_scope_exit = batt::finally([&] {
+    this->update_grant_.subsume(std::move(slot_grant));
+  });
 
   // 3. Lock the State and process the txn.
   //
@@ -561,6 +605,49 @@ inline StatusOr<SlotReadLock> PageAllocator::update_page_ref_counts(
   // Done; return the slot lock.
   //
   return txn_slot_lock;
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+template <typename AttachEventT>
+inline StatusOr<slot_offset_type> PageAllocator::process_attach_event(const AttachEventT& event)
+{
+  StatusOr<slot_offset_type> slot_upper_bound;
+
+  const usize payload_size = packed_sizeof(event);
+  const usize slot_size = packed_sizeof_slot_with_payload_size(payload_size);
+
+  BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant,
+                        this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue));
+
+  // Return any unused part of the slot grant to the update grant pool; _not_ the default log pool
+  // maintained by the slot writer.
+  //
+  auto on_scope_exit = batt::finally([&] {
+    this->update_grant_.subsume(std::move(slot_grant));
+  });
+
+  const bool desired_state = std::is_same_v<std::decay_t<AttachEventT>, PackedPageAllocatorAttach>;
+
+  {
+    batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+    if (locked_state->is_user_attached(event.user_id) == desired_state) {
+      return OkStatus();
+    }
+
+    StatusOr<SlotParseWithPayload<const AttachEventT*>> packed_slot =
+        this->slot_writer_.typed_append(slot_grant, event);
+
+    BATT_REQUIRE_OK(packed_slot);
+    BATT_REQUIRE_OK(locked_state->update(packed_slot->slot, *packed_slot->payload));
+
+    slot_upper_bound = packed_slot->slot.offset.upper_bound;
+  }
+
+  BATT_CHECK_OK(slot_upper_bound);
+
+  return slot_upper_bound;
 }
 
 }  //namespace experimental

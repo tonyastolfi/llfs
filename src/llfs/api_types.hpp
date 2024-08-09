@@ -83,6 +83,10 @@ BATT_STRONG_TYPEDEF(usize, BufferCount);
  */
 BATT_STRONG_TYPEDEF(usize, BufferSize);
 
+/** \brief A pseudo-random number generator seed.
+ */
+BATT_STRONG_TYPEDEF(u32, RandomSeed);
+
 }  // namespace llfs
 
 #endif  // LLFS_API_TYPES_HPP

@@ -10,6 +10,7 @@
 //
 #include <llfs/page_allocator2.hpp>
 
+#include <llfs/storage_simulation.hpp>
 #include <llfs/uuid.hpp>
 
 #include <llfs/testing/test_config.hpp>
@@ -25,8 +26,81 @@ namespace {
 
 using namespace batt::int_types;
 
+using llfs::Status;
 using llfs::StatusOr;
 using llfs::experimental::PageAllocator;
+
+class PageAllocator2SimTest : public ::testing::Test
+{
+ public:
+  void run_scenarios(u32 n_seeds,
+                     const std::function<void(u32 seed, llfs::StorageSimulation& sim)>& test_body)
+  {
+    const u32 first_seed = this->test_config.get_random_seed();
+    for (u32 seed_i = 0; seed_i < n_seeds; ++seed_i) {
+      const u32 seed = first_seed + seed_i;
+
+      llfs::StorageSimulation sim{llfs::RandomSeed{seed}};
+
+      sim.run_main_task([&] {
+        ASSERT_NO_FATAL_FAILURE(test_body(seed, sim));
+      });
+    }
+  }
+
+  void recover(llfs::StorageSimulation& sim, std::unique_ptr<PageAllocator>& page_allocator)
+  {
+    StatusOr<std::unique_ptr<PageAllocator>> recovered = PageAllocator::recover(
+        llfs::PageAllocatorRuntimeOptions{sim.task_scheduler(), kTestObjectName},
+        llfs::PageIdFactory{this->page_count, this->page_device_id}, this->max_attachments,
+        *sim.get_log_device_factory(kTestLogName,
+                                    /*capacity=*/PageAllocator::calculate_log_size(
+                                        this->page_count, this->max_attachments)));
+
+    ASSERT_TRUE(recovered.ok()) << BATT_INSPECT(recovered.status());
+
+    page_allocator = std::move(*recovered);
+  }
+
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
+
+  llfs::testing::TestConfig test_config;
+
+  const std::string kTestObjectName = "page_allocator2_test";
+  const std::string kTestLogName = "page_allocator2_test_log";
+
+  llfs::PageCount page_count{32};
+
+  llfs::page_device_id_int page_device_id = 7;
+
+  llfs::MaxAttachments max_attachments{4};
+};
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+TEST_F(PageAllocator2SimTest, Recover)
+{
+  this->run_scenarios(/*n_seeds=*/1000, [&](u32 seed, llfs::StorageSimulation& sim) {
+    LLFS_LOG_INFO_EVERY_N(100) << BATT_INSPECT(seed);
+
+    std::unique_ptr<PageAllocator> page_allocator;
+
+    ASSERT_NO_FATAL_FAILURE(this->recover(sim, page_allocator));
+
+    {
+      Status users_recovered =
+          page_allocator->require_users_recovered(batt::WaitForResource::kFalse);
+
+      ASSERT_TRUE(users_recovered.ok()) << BATT_INSPECT(users_recovered);
+    }
+    {
+      Status users_recovered =
+          page_allocator->require_users_recovered(batt::WaitForResource::kTrue);
+
+      ASSERT_TRUE(users_recovered.ok()) << BATT_INSPECT(users_recovered);
+    }
+  });
+}
 
 // Test Plan:
 //  1. calculate log size
@@ -35,10 +109,10 @@ using llfs::experimental::PageAllocator;
 //     b. allocate_page should succeed without blocking until no more pages
 //     c. deallocate_page should unblock an allocator; allow page to be reallocated (same
 //        generation).
-//  3. simulate workload with hot pages and cold pages; run for long enough so that log rolls over
+//  3. try to update pages without attaching - fail
+//  -. simulate workload with hot pages and cold pages; run for long enough so that log rolls over
 //     several times
 //     - verify that the hot page ref count updates don't cause the cold page ref counts to be lost
-//  4. try to update pages without attaching - fail
 //  5.
 //
 //

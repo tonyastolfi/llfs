@@ -54,6 +54,11 @@ class StorageSimulation
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
+  /** \brief Creates a new StorageSimulation using a default random engine seeded with the passed
+   * value.
+   */
+  explicit StorageSimulation(RandomSeed seed) noexcept;
+
   /** \brief Creates a new StorageSimulation context that draws from the passed entropy source.
    */
   explicit StorageSimulation(batt::StateMachineEntropySource&& entropy_source) noexcept;
@@ -202,6 +207,15 @@ class StorageSimulation
    * function is called for a given name (i.e., when the log is initially created)
    */
   std::unique_ptr<LogDevice> get_log_device(const std::string& name, Optional<u64> capacity = None);
+
+  /** \brief Creates/accesses a simulated LogDevice via the LogDeviceFactory interface.
+   *
+   * \param name A unique name used to identify the LogDevice in the context of this simulation
+   * \param capacity The maximum size in bytes of the log; must be specified the first time this
+   * function is called for a given name (i.e., when the log is initially created)
+   */
+  std::unique_ptr<LogDeviceFactory> get_log_device_factory(const std::string& name,
+                                                           Optional<u64> capacity = None);
 
   /** \brief Creates/accesses a simulated PageDevice.
    *

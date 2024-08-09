@@ -178,7 +178,8 @@ Status PageAllocatorState::update(const SlotParse& slot,
 Status PageAllocatorState::update(const SlotParse& slot, const PackedPageAllocatorTxn& txn) noexcept
 {
   if (this->in_recovery_mode) {
-    SlotReadLock& txn_slot_lock = this->pending_recovery[txn.user_id][txn.user_slot.value()];
+    SlotReadLock& txn_slot_lock =
+        this->pending_recovery[txn.user_id].pending_txns[txn.user_slot.value()];
 
     // There should be no read lock currently held for this user/slot; txns must have unique user
     // slot numbers!
@@ -487,11 +488,15 @@ Status PageAllocatorState::validate_and_apply_ref_count_deltas(
 
   // Recover state from the log.
   //
-  BATT_REQUIRE_OK(page_allocator->recover_impl());
+  BATT_ASSIGN_OK_RESULT(SlotRange recovered_slot_range, page_allocator->recover_impl());
 
   // Start background compaction task.
   //
   page_allocator->start_checkpoint_task(options.scheduler);
+
+  // Start the free page task.
+  //
+  page_allocator->start_free_page_task(options.scheduler, recovered_slot_range.upper_bound);
 
   // Success!
   //
@@ -551,12 +556,163 @@ void PageAllocator::join() noexcept
     this->checkpoint_task_->join();
     this->checkpoint_task_ = None;
   }
+  if (this->free_page_task_) {
+    this->free_page_task_->join();
+    this->free_page_task_ = None;
+  }
   this->log_device_->join();
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-Status PageAllocator::recover_impl()
+StatusOr<std::map<slot_offset_type, SlotReadLock>> PageAllocator::get_pending_recovery(
+    const boost::uuids::uuid& user_id)
+{
+  std::map<slot_offset_type, SlotReadLock> result;
+  {
+    batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+    auto iter = locked_state->pending_recovery.find(user_id);
+    if (iter == locked_state->pending_recovery.end()) {
+      return {batt::StatusCode::kNotFound};
+    }
+
+    if (iter->second.recovery_started) {
+      return {batt::StatusCode::kUnavailable};
+    }
+
+    std::swap(result, iter->second.pending_txns);
+    iter->second.recovery_started = true;
+  }
+  return result;
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+Status PageAllocator::notify_user_recovered(const boost::uuids::uuid& user_id)
+{
+  {
+    batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+    auto iter = locked_state->pending_recovery.find(user_id);
+    if (iter == locked_state->pending_recovery.end()) {
+      return {batt::StatusCode::kNotFound};
+    }
+
+    // Check to see if a user is telling us it has completed recovery, but it hasn't asked for
+    // pending txns.
+    //
+    if (!iter->second.recovery_started) {
+      return {batt::StatusCode::kFailedPrecondition};
+    }
+
+    // We no longer need to track this user's recovery state.
+    //
+    locked_state->pending_recovery.erase(iter);
+  }
+  const i64 prior_count = this->recovering_user_count_.fetch_sub(1);
+  BATT_CHECK_GT(prior_count, 0);
+
+  return OkStatus();
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+Status PageAllocator::require_users_recovered(batt::WaitForResource wait_for_resource)
+{
+  if (wait_for_resource == batt::WaitForResource::kFalse) {
+    if (BATT_HINT_FALSE(this->recovering_user_count_.get_value() > 0)) {
+      return {batt::StatusCode::kUnavailable};
+    }
+  } else {
+    BATT_REQUIRE_OK(this->recovering_user_count_.await_equal(0));
+  }
+
+  return OkStatus();
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+StatusOr<slot_offset_type> PageAllocator::attach_user(const boost::uuids::uuid& user_id)
+{
+  return this->process_attach_event(PackedPageAllocatorAttach{
+      .user_id = user_id,
+  });
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+StatusOr<slot_offset_type> PageAllocator::detach_user(const boost::uuids::uuid& user_id)
+{
+  return this->process_attach_event(PackedPageAllocatorDetach{
+      .user_id = user_id,
+  });
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+StatusOr<PageId> PageAllocator::allocate_page(batt::WaitForResource wait_for_resource,
+                                              const batt::CancelToken& cancel_token)
+{
+  // If some attached users are still recovering, then fail/block (to prevent accidental
+  // re-allocation of a page that belonged to some page job that was partially committed).
+  //
+  BATT_REQUIRE_OK(this->require_users_recovered(wait_for_resource));
+
+  for (;;) {
+    // First observe the push count in case we need to wait for it to change below (but only if
+    // wait_for_resource is true).
+    //
+    const u64 observed_push_count = (wait_for_resource == batt::WaitForResource::kTrue)
+                                        ? this->free_pool_push_count_.get_value()
+                                        : 0;
+
+    // Try to pop a free page from the lock-free free_pool_ stack.
+    //
+    {
+      PageId page_id;
+      if (this->free_pool_.pop(page_id)) {
+        return page_id;
+      }
+    }
+
+    if (wait_for_resource == batt::WaitForResource::kFalse) {
+      LLFS_LOG_INFO_FIRST_N(1) << "Unable to allocate page (pool is empty)"
+                               << "; device=" << this->page_ids_.get_device_id();
+
+      return {batt::StatusCode::kResourceExhausted};
+    }
+
+    // Wait until the allocate has been cancelled (via `cancel_token`) or the value of
+    // `this->free_pool_push_count_` changes.
+    //
+    BATT_DEBUG_INFO("[PageAllocator::allocate_page] waiting for free page");
+    if (cancel_token) {
+      StatusOr<u64> new_count = cancel_token.await<u64>([&](auto&& handler) {
+        this->free_pool_push_count_.async_wait(observed_push_count, BATT_FORWARD(handler));
+      });
+      BATT_REQUIRE_OK(new_count) << BATT_INSPECT(cancel_token.debug_info());
+    } else {
+      BATT_REQUIRE_OK(this->free_pool_push_count_.await_not_equal(observed_push_count));
+    }
+    //
+    // Loop back around to try again...
+  }
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocator::deallocate_page(PageId page_id)
+{
+  const bool success = this->free_pool_.push(page_id);
+  BATT_CHECK(success);
+
+  this->free_pool_push_count_.fetch_add(1);
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+StatusOr<SlotRange> PageAllocator::recover_impl()
 {
   batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
 
@@ -632,6 +788,8 @@ Status PageAllocator::recover_impl()
           checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
           return OkStatus();
         }));
+
+    LLFS_CHECK_SLOT_LE(checkpoint_lock_range.lower_bound, checkpoint_lock_range.upper_bound);
   }
 
   // Lock the "live" data range (i.e. slots not made obsolete by some later checkpoint or update).
@@ -654,14 +812,14 @@ Status PageAllocator::recover_impl()
   // Sanity checks.
   //
   if (locked_state->pending_recovery.size() > this->max_attachments_) {
-    return batt::StatusCode::kInternal;  // TODO [tastolfi 2024-03-20]
+    return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
   }
   if (locked_state->attach_state.size() > this->max_attachments_) {
-    return batt::StatusCode::kInternal;  // TODO [tastolfi 2024-03-20]
+    return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
   }
   for (const auto& [user_id, pending_txns] : locked_state->pending_recovery) {
     if (!locked_state->attach_state.count(user_id)) {
-      return batt::StatusCode::kInternal;  // TODO [tastolfi 2024-03-20]
+      return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
     }
   }
 
@@ -669,12 +827,15 @@ Status PageAllocator::recover_impl()
   //
   {
     usize push_count = 0;
+    this->durable_page_in_use_.resize(physical_page_count, false);
     for (i64 physical_page = 0; physical_page < physical_page_count; ++physical_page) {
       PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
       if (page_state.ref_count == 0) {
         const PageId page_id = this->page_ids_.make_page_id(physical_page, page_state.generation);
         BATT_CHECK(this->free_pool_.unsynchronized_push(page_id));
         ++push_count;
+      } else {
+        this->durable_page_in_use_.set(physical_page, true);
       }
     }
     this->free_pool_push_count_.fetch_add(push_count);
@@ -686,13 +847,69 @@ Status PageAllocator::recover_impl()
   this->recovering_user_count_.fetch_add(locked_state->attach_state.size());
   this->recovering_user_count_.fetch_sub(1);
 
-  return OkStatus();
+  // Cross-check the attach_state and pending_recovery maps.
+  //
+  for (const auto& kvp : locked_state->attach_state) {
+    const boost::uuids::uuid& user_id = kvp.first;
+    BATT_CHECK_EQ(locked_state->pending_recovery.count(user_id), 1)
+        << "Found attached user with no pending recovery state!" << BATT_INSPECT(user_id);
+  }
+  for (const auto& kvp : locked_state->pending_recovery) {
+    const boost::uuids::uuid& user_id = kvp.first;
+    BATT_CHECK_EQ(locked_state->attach_state.count(user_id), 1)
+        << "Found one or more txns for non-attached user: " << user_id;
+  }
+
+  return checkpoint_lock_range;
 }
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+Status PageAllocator::sync(slot_offset_type min_slot)
+{
+  return this->log_device_->sync(LogReadMode::kDurable, SlotUpperBoundAt{
+                                                            .offset = min_slot,
+                                                        });
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+StatusOr<i32> PageAllocator::get_ref_count(PageId page_id)
+{
+  if (this->page_ids_.get_device_id(page_id) != this->page_ids_.get_device_id()) {
+    return {batt::StatusCode::kInvalidArgument};
+  }
+
+  const u64 physical_page_count = this->page_ids_.get_physical_page_count();
+  const u64 physical_page = this->page_ids_.get_physical_page(page_id);
+
+  if (physical_page >= physical_page_count) {
+    return {batt::StatusCode::kOutOfRange};
+  }
+
+  const page_generation_int generation = this->page_ids_.get_generation(page_id);
+  {
+    batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+    const PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
+
+    if (page_state.generation != generation) {
+      return {batt::StatusCode::kInvalidArgument};
+    }
+
+    return page_state.ref_count;
+  }
+}
+
+//=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
+// private
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 void PageAllocator::start_checkpoint_task(batt::TaskScheduler& scheduler)
 {
+  BATT_CHECK_EQ(this->checkpoint_task_, None);
+
   this->checkpoint_task_.emplace(
       scheduler.schedule_task(),
       [this]() mutable {
@@ -700,6 +917,22 @@ void PageAllocator::start_checkpoint_task(batt::TaskScheduler& scheduler)
       },
       /*name=*/
       batt::to_string("PageAllocator{", batt::c_str_literal(this->name_), "}::checkpoint_task"));
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocator::start_free_page_task(batt::TaskScheduler& scheduler,
+                                         slot_offset_type recovered_slot_upper_bound)
+{
+  BATT_CHECK_EQ(this->free_page_task_, None);
+
+  this->free_page_task_.emplace(
+      scheduler.schedule_task(),
+      [this, recovered_slot_upper_bound]() mutable {
+        this->free_page_task_main(recovered_slot_upper_bound);
+      },
+      /*name=*/
+      batt::to_string("PageAllocator{", batt::c_str_literal(this->name_), "}::free_page_task"));
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -803,6 +1036,77 @@ void PageAllocator::checkpoint_task_main() noexcept
         }
       }
     }
+  }();
+
+  LLFS_VLOG(1) << BATT_INSPECT(status);
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocator::free_page_task_main(slot_offset_type recovered_slot_upper_bound) noexcept
+{
+  Status status = [&]() -> Status {
+    // Helper function - given a PackedPageRefCount, update the `durable_page_in_use_` bit set and
+    // push newly freed pages onto `this->free_pool_`.
+    //
+    const auto update_page_state =
+        [this, physical_page_count =
+                   this->page_ids_.get_physical_page_count()](const PackedPageRefCount& pprc) {
+          const PageId page_id = pprc.page_id.unpack();
+          const u64 physical_page = this->page_ids_.get_physical_page(page_id);
+
+          BATT_CHECK_LT(physical_page, physical_page_count);
+          BATT_CHECK_GE(pprc.ref_count, 0);
+
+          const bool old_in_use = this->durable_page_in_use_.test(physical_page);
+          const bool new_in_use = (pprc.ref_count != 0);
+
+          if (old_in_use != new_in_use) {
+            if (!new_in_use) {
+              const bool success = this->free_pool_.push(page_id);
+              BATT_CHECK(success);
+
+              const u64 prior_count = this->free_pool_push_count_.fetch_add(1);
+              const u64 new_count = prior_count + 1;
+
+              BATT_CHECK_GT(new_count, prior_count);
+            }
+            this->durable_page_in_use_.set(physical_page, new_in_use);
+          }
+        };
+
+    // Do a blocking read of all durable Txn and Page Ref Count events as they are appended to the
+    // log and flushed.
+    //
+    std::unique_ptr<LogDevice::Reader> log_reader =
+        this->log_device_->new_reader(recovered_slot_upper_bound, LogReadMode::kDurable);
+
+    TypedSlotReader<PackedPageAllocatorEvent> slot_reader{*log_reader};
+
+    BATT_REQUIRE_OK(slot_reader.run(
+        batt::WaitForResource::kTrue,
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& /*slot*/, const PackedPageAllocatorTxn& txn) -> Status {
+          for (const PackedPageRefCount& pprc : txn.ref_counts) {
+            update_page_state(pprc);
+          }
+          return OkStatus();
+        },
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& /*slot*/, const PackedPageRefCount& pprc) -> Status {
+          update_page_state(pprc);
+          return OkStatus();
+        },
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& /*slot*/, const PackedPageAllocatorAttach& /*ignored*/) -> Status {
+          return OkStatus();
+        },
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& /*slot*/, const PackedPageAllocatorDetach& /*ignored*/) -> Status {
+          return OkStatus();
+        }));
+
+    return OkStatus();
   }();
 
   LLFS_VLOG(1) << BATT_INSPECT(status);
