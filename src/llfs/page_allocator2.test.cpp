@@ -183,6 +183,97 @@ TEST_F(PageAllocator2SimTest, UpdateRefCountsNoAttach)
   });
 }
 
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+TEST_F(PageAllocator2SimTest, AllocatePages)
+{
+  this->run_scenarios(/*n_seeds=*/1000, [&](u32 seed, llfs::StorageSimulation& sim) {
+    LLFS_LOG_INFO_EVERY_N(100) << BATT_INSPECT(seed);
+
+    // Keep track of expected page values.
+    //
+    std::map<llfs::PageId, i32> expected;
+    llfs::slot_offset_type user_slot = 34567;
+
+    //+++++++++++-+-+--+----- --- -- -  -  -   -
+    {
+      // Create an object to test.
+      //
+      std::unique_ptr<PageAllocator> page_allocator;
+      ASSERT_NO_FATAL_FAILURE(this->recover(sim, page_allocator));
+
+      // Generate a set of random page ref count updates, using `allocate_page` to get unused
+      // PageIds.
+      //
+      const usize n_pages = sim.pick_int(1, 3);
+      std::vector<llfs::PageRefCount> ref_count_updates;
+
+      for (usize i = 0; i < n_pages; ++i) {
+        StatusOr<llfs::PageId> page_id =
+            page_allocator->allocate_page(batt::WaitForResource::kFalse);
+        ASSERT_TRUE(page_id.ok()) << BATT_INSPECT(page_id);
+
+        const i32 n_refs = sim.pick_int(2, 5);
+
+        ref_count_updates.emplace_back(llfs::PageRefCount{
+            .page_id = *page_id,
+            .ref_count = n_refs,
+        });
+      }
+
+      // Attach the test user before applying updates.
+      //
+      StatusOr<llfs::slot_offset_type> attach_slot = page_allocator->attach_user(this->user_id);
+      ASSERT_TRUE(attach_slot.ok()) << BATT_INSPECT(attach_slot);
+
+      Status attach_sync = page_allocator->sync(*attach_slot);
+      ASSERT_TRUE(attach_sync.ok()) << BATT_INSPECT(attach_sync);
+
+      // Apply updates.
+      //
+      StatusOr<llfs::SlotReadLock> txn_lock = page_allocator->update_page_ref_counts(
+          this->user_id, user_slot, llfs::as_seq(ref_count_updates));
+      ASSERT_TRUE(txn_lock.ok()) << BATT_INSPECT(txn_lock.status());
+
+      // Update expected values.
+      //
+      for (const llfs::PageRefCount& prc : ref_count_updates) {
+        expected[prc.page_id] += prc.ref_count;
+      }
+
+      // Validate expected values.
+      //
+      for (const auto [page_id, expected_ref_count] : expected) {
+        StatusOr<i32> actual_ref_count = page_allocator->get_ref_count(page_id);
+        ASSERT_TRUE(actual_ref_count.ok()) << BATT_INSPECT(actual_ref_count);
+
+        EXPECT_EQ(*actual_ref_count, expected_ref_count);
+      }
+
+      Status txn_sync = page_allocator->sync(txn_lock->slot_range().upper_bound);
+      ASSERT_TRUE(txn_sync.ok()) << BATT_INSPECT(txn_sync);
+
+    }  // (close everything down)
+
+    //+++++++++++-+-+--+----- --- -- -  -  -   -
+    {
+      // Recover the page allocator from the simulated storage layer.
+      //
+      std::unique_ptr<PageAllocator> page_allocator;
+      ASSERT_NO_FATAL_FAILURE(this->recover(sim, page_allocator));
+
+      // Validate expected values.
+      //
+      for (const auto [page_id, expected_ref_count] : expected) {
+        StatusOr<i32> actual_ref_count = page_allocator->get_ref_count(page_id);
+        ASSERT_TRUE(actual_ref_count.ok()) << BATT_INSPECT(actual_ref_count);
+
+        EXPECT_EQ(*actual_ref_count, expected_ref_count);
+      }
+    }
+  });
+}
+
 // Test Plan:
 //  1. calculate log size
 //  2. recover from empty log

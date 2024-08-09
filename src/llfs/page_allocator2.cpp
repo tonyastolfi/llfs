@@ -505,6 +505,181 @@ Status PageAllocatorState::validate_and_apply_ref_count_deltas(
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
+StatusOr<SlotRange> PageAllocator::recover_impl()
+{
+  Optional<SlotReadLock> tmp_slot_lock;
+
+  batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+  const i64 physical_page_count =
+      BATT_CHECKED_CAST(i64, this->page_ids_.get_physical_page_count().value());
+
+  SlotRange checkpoint_lock_range{
+      .lower_bound = 0,
+      .upper_bound = 0,
+  };
+
+  // Scan the log slots to restore state.
+  //
+  {
+    std::unique_ptr<LogDevice::Reader> log_reader =
+        this->log_device_->new_reader(/*lower_bound=*/None, /*mode=*/LogReadMode::kDurable);
+
+    checkpoint_lock_range.lower_bound = log_reader->slot_offset();
+
+    // Acquire an initial lock on the entire recovered range; this will be released later when we've
+    // figured out which slots can be trimmed.
+    //
+    BATT_ASSIGN_OK_RESULT(tmp_slot_lock, this->trim_control_->lock_slots(
+                                             SlotRange{
+                                                 .lower_bound = checkpoint_lock_range.lower_bound,
+                                                 .upper_bound = checkpoint_lock_range.lower_bound,
+                                             },
+                                             "PageAllocator::recover_impl() - tmp_slot_lock"));
+
+    {
+      TypedSlotReader<PackedPageAllocatorEvent> slot_reader{*log_reader};
+
+      BATT_REQUIRE_OK(slot_reader.run(batt::WaitForResource::kFalse,
+                                      //----- --- -- -  -  -   -
+                                      [&](const SlotParse& slot, const auto& event) -> Status {
+                                        LLFS_VLOG(1) << BATT_INSPECT(slot) << " " << event;
+                                        return locked_state->update(slot, event);
+                                      }));
+    }
+    checkpoint_lock_range.upper_bound = log_reader->slot_offset();
+  }
+
+  // Do another scan to find the current trim target.
+  //
+  {
+    std::unique_ptr<LogDevice::Reader> log_reader =
+        this->log_device_->new_reader(/*lower_bound=*/checkpoint_lock_range.lower_bound,
+                                      /*mode=*/LogReadMode::kDurable);
+
+    TypedSlotReader<PackedPageAllocatorEvent> slot_reader{*log_reader};
+
+    StatusOr<usize> read_status = slot_reader.run(
+        batt::WaitForResource::kFalse,
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& slot, const PackedPageAllocatorAttach& attach) -> Status {
+          if (!locked_state->updated_since(slot.offset.upper_bound, attach.user_id)) {
+            return batt::StatusCode::kLoopBreak;
+          }
+          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
+          return OkStatus();
+        },
+
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& slot, const PackedPageAllocatorDetach& /*event*/) -> Status {
+          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
+          return OkStatus();
+        },
+
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& slot, const PackedPageRefCount& pprc) -> Status {
+          if (!locked_state->updated_since(slot.offset.upper_bound, pprc.page_id.unpack())) {
+            return batt::StatusCode::kLoopBreak;
+          }
+          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
+          return OkStatus();
+        },
+
+        //----- --- -- -  -  -   -
+        [&](const SlotParse& slot, const PackedPageAllocatorTxn& txn) -> Status {
+          for (const PackedPageRefCount& pprc : txn.ref_counts) {
+            if (!locked_state->updated_since(slot.offset.upper_bound, pprc.page_id.unpack())) {
+              return batt::StatusCode::kLoopBreak;
+            }
+          }
+          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
+          return OkStatus();
+        });
+
+    if (!read_status.ok() && read_status.status() != batt::StatusCode::kLoopBreak) {
+      BATT_REQUIRE_OK(read_status);
+    }
+
+    LLFS_CHECK_SLOT_LE(checkpoint_lock_range.lower_bound, checkpoint_lock_range.upper_bound);
+  }
+
+  // Lock the "live" data range (i.e. slots not made obsolete by some later checkpoint or update).
+  //
+  LLFS_VLOG(1) << "Acquiring checkpoint trim lock on slot range " << checkpoint_lock_range
+               << BATT_INSPECT(this->trim_control_->get_locked_range()) << " "
+               << this->trim_control_->debug_info();
+
+  this->checkpoint_trim_lock_ = BATT_OK_RESULT_OR_PANIC(
+      this->trim_control_->lock_slots(checkpoint_lock_range, "PageAllocator::recover_impl"));
+
+  // Trim as much as we can.
+  //
+  BATT_REQUIRE_OK(this->slot_writer_.trim(this->trim_control_->get_lower_bound()));
+
+  this->checkpoint_grant_pool_.subsume(  //
+      this->slot_writer_.reserve_or_panic(this->get_target_checkpoint_grant_pool_size(),
+                                          batt::WaitForResource::kFalse));
+
+  this->update_grant_.subsume(  //
+      this->slot_writer_.reserve_or_panic(this->slot_writer_.pool_size(),
+                                          batt::WaitForResource::kFalse));
+
+  // Sanity checks.
+  //
+  if (locked_state->pending_recovery.size() > this->max_attachments_) {
+    return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
+  }
+  if (locked_state->attach_state.size() > this->max_attachments_) {
+    return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
+  }
+  for (const auto& [user_id, pending_txns] : locked_state->pending_recovery) {
+    if (!locked_state->attach_state.count(user_id)) {
+      return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
+    }
+  }
+
+  // Populate the free pool.
+  //
+  {
+    usize push_count = 0;
+    this->durable_page_in_use_.resize(physical_page_count, false);
+    for (i64 physical_page = 0; physical_page < physical_page_count; ++physical_page) {
+      PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
+      if (page_state.ref_count == 0) {
+        const PageId page_id = this->page_ids_.make_page_id(physical_page, page_state.generation);
+        BATT_CHECK(this->free_pool_.unsynchronized_push(page_id));
+        ++push_count;
+      } else {
+        this->durable_page_in_use_.set(physical_page, true);
+      }
+    }
+    this->free_pool_push_count_.fetch_add(push_count);
+  }
+
+  // Update recovering_user_count_; remove the initial count of 1 only after increasing by the
+  // number of attachments found.
+  //
+  this->recovering_user_count_.fetch_add(locked_state->attach_state.size());
+  this->recovering_user_count_.fetch_sub(1);
+
+  // Cross-check the attach_state and pending_recovery maps.
+  //
+  for (const auto& kvp : locked_state->attach_state) {
+    const boost::uuids::uuid& user_id = kvp.first;
+    BATT_CHECK_EQ(locked_state->pending_recovery.count(user_id), 1)
+        << "Found attached user with no pending recovery state!" << BATT_INSPECT(user_id);
+  }
+  for (const auto& kvp : locked_state->pending_recovery) {
+    const boost::uuids::uuid& user_id = kvp.first;
+    BATT_CHECK_EQ(locked_state->attach_state.count(user_id), 1)
+        << "Found one or more txns for non-attached user: " << user_id;
+  }
+
+  return checkpoint_lock_range;
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
 PageAllocator::PageAllocator(std::string&& name, const PageIdFactory& page_ids, u64 max_attachments,
                              std::unique_ptr<LogDevice>&& log_device,
                              std::unique_ptr<SlotLockManager>&& trim_control) noexcept
@@ -708,159 +883,6 @@ void PageAllocator::deallocate_page(PageId page_id)
   BATT_CHECK(success);
 
   this->free_pool_push_count_.fetch_add(1);
-}
-
-//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-//
-StatusOr<SlotRange> PageAllocator::recover_impl()
-{
-  batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
-
-  const i64 physical_page_count =
-      BATT_CHECKED_CAST(i64, this->page_ids_.get_physical_page_count().value());
-
-  SlotRange checkpoint_lock_range{
-      .lower_bound = 0,
-      .upper_bound = 0,
-  };
-
-  // Scan the log slots to restore state.
-  //
-  {
-    std::unique_ptr<LogDevice::Reader> log_reader =
-        this->log_device_->new_reader(/*lower_bound=*/None, /*mode=*/LogReadMode::kDurable);
-
-    checkpoint_lock_range.lower_bound = log_reader->slot_offset();
-    {
-      TypedSlotReader<PackedPageAllocatorEvent> slot_reader{*log_reader};
-
-      BATT_REQUIRE_OK(slot_reader.run(batt::WaitForResource::kFalse,
-                                      //----- --- -- -  -  -   -
-                                      [&](const SlotParse& slot, const auto& event) -> Status {
-                                        return locked_state->update(slot, event);
-                                      }));
-    }
-    checkpoint_lock_range.upper_bound = log_reader->slot_offset();
-  }
-
-  // Do another scan to find the current trim target.
-  //
-  {
-    std::unique_ptr<LogDevice::Reader> log_reader =
-        this->log_device_->new_reader(/*lower_bound=*/checkpoint_lock_range.lower_bound,
-                                      /*mode=*/LogReadMode::kDurable);
-
-    TypedSlotReader<PackedPageAllocatorEvent> slot_reader{*log_reader};
-
-    BATT_REQUIRE_OK(slot_reader.run(
-        batt::WaitForResource::kFalse,
-        //----- --- -- -  -  -   -
-        [&](const SlotParse& slot, const PackedPageAllocatorAttach& attach) -> Status {
-          if (!locked_state->updated_since(slot.offset.upper_bound, attach.user_id)) {
-            return batt::StatusCode::kLoopBreak;
-          }
-          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
-          return OkStatus();
-        },
-
-        //----- --- -- -  -  -   -
-        [&](const SlotParse& slot, const PackedPageAllocatorDetach& /*event*/) -> Status {
-          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
-          return OkStatus();
-        },
-
-        //----- --- -- -  -  -   -
-        [&](const SlotParse& slot, const PackedPageRefCount& pprc) -> Status {
-          if (!locked_state->updated_since(slot.offset.upper_bound, pprc.page_id.unpack())) {
-            return batt::StatusCode::kLoopBreak;
-          }
-          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
-          return OkStatus();
-        },
-
-        //----- --- -- -  -  -   -
-        [&](const SlotParse& slot, const PackedPageAllocatorTxn& txn) -> Status {
-          for (const PackedPageRefCount& pprc : txn.ref_counts) {
-            if (!locked_state->updated_since(slot.offset.upper_bound, pprc.page_id.unpack())) {
-              return batt::StatusCode::kLoopBreak;
-            }
-          }
-          checkpoint_lock_range.lower_bound = slot.offset.upper_bound;
-          return OkStatus();
-        }));
-
-    LLFS_CHECK_SLOT_LE(checkpoint_lock_range.lower_bound, checkpoint_lock_range.upper_bound);
-  }
-
-  // Lock the "live" data range (i.e. slots not made obsolete by some later checkpoint or update).
-  //
-  this->checkpoint_trim_lock_ = BATT_OK_RESULT_OR_PANIC(
-      this->trim_control_->lock_slots(checkpoint_lock_range, "PageAllocator::recover_impl"));
-
-  // Trim as much as we can.
-  //
-  BATT_REQUIRE_OK(this->slot_writer_.trim(this->trim_control_->get_lower_bound()));
-
-  this->checkpoint_grant_pool_.subsume(  //
-      this->slot_writer_.reserve_or_panic(this->get_target_checkpoint_grant_pool_size(),
-                                          batt::WaitForResource::kFalse));
-
-  this->update_grant_.subsume(  //
-      this->slot_writer_.reserve_or_panic(this->slot_writer_.pool_size(),
-                                          batt::WaitForResource::kFalse));
-
-  // Sanity checks.
-  //
-  if (locked_state->pending_recovery.size() > this->max_attachments_) {
-    return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
-  }
-  if (locked_state->attach_state.size() > this->max_attachments_) {
-    return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
-  }
-  for (const auto& [user_id, pending_txns] : locked_state->pending_recovery) {
-    if (!locked_state->attach_state.count(user_id)) {
-      return {batt::StatusCode::kInternal};  // TODO [tastolfi 2024-03-20]
-    }
-  }
-
-  // Populate the free pool.
-  //
-  {
-    usize push_count = 0;
-    this->durable_page_in_use_.resize(physical_page_count, false);
-    for (i64 physical_page = 0; physical_page < physical_page_count; ++physical_page) {
-      PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
-      if (page_state.ref_count == 0) {
-        const PageId page_id = this->page_ids_.make_page_id(physical_page, page_state.generation);
-        BATT_CHECK(this->free_pool_.unsynchronized_push(page_id));
-        ++push_count;
-      } else {
-        this->durable_page_in_use_.set(physical_page, true);
-      }
-    }
-    this->free_pool_push_count_.fetch_add(push_count);
-  }
-
-  // Update recovering_user_count_; remove the initial count of 1 only after increasing by the
-  // number of attachments found.
-  //
-  this->recovering_user_count_.fetch_add(locked_state->attach_state.size());
-  this->recovering_user_count_.fetch_sub(1);
-
-  // Cross-check the attach_state and pending_recovery maps.
-  //
-  for (const auto& kvp : locked_state->attach_state) {
-    const boost::uuids::uuid& user_id = kvp.first;
-    BATT_CHECK_EQ(locked_state->pending_recovery.count(user_id), 1)
-        << "Found attached user with no pending recovery state!" << BATT_INSPECT(user_id);
-  }
-  for (const auto& kvp : locked_state->pending_recovery) {
-    const boost::uuids::uuid& user_id = kvp.first;
-    BATT_CHECK_EQ(locked_state->attach_state.count(user_id), 1)
-        << "Found one or more txns for non-attached user: " << user_id;
-  }
-
-  return checkpoint_lock_range;
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -

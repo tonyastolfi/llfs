@@ -134,9 +134,23 @@ class StorageSimulation
     return this->task_scheduler().schedule_task();
   }
 
+  /** \brief Convenience: invokes this->entropy_source().pick_int(min_value, max_value).
+   */
+  usize pick_int(usize min_value, usize max_value) const
+  {
+    return this->entropy_source().pick_int(min_value, max_value);
+  }
+
   /** \brief Returns a reference to the entropy source passed in at construction time.
    */
   batt::StateMachineEntropySource& entropy_source() noexcept
+  {
+    return this->entropy_source_;
+  }
+
+  /** \brief Returns a reference to the entropy source passed in at construction time.
+   */
+  const batt::StateMachineEntropySource& entropy_source() const noexcept
   {
     return this->entropy_source_;
   }

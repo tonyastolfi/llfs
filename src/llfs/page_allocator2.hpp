@@ -641,6 +641,12 @@ inline StatusOr<slot_offset_type> PageAllocator::process_attach_event(const Atta
       return OkStatus();
     }
 
+    // Check to make sure we have a free attachment available.
+    //
+    if (desired_state && (locked_state->attach_state.size() + 1 > this->max_attachments_)) {
+      return ::llfs::make_status(llfs::StatusCode::kOutOfAttachments);
+    }
+
     StatusOr<SlotParseWithPayload<const AttachEventT*>> packed_slot =
         this->slot_writer_.typed_append(slot_grant, event);
 
