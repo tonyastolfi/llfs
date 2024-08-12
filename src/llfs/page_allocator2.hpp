@@ -17,6 +17,7 @@
 #include <llfs/define_packed_type.hpp>
 #include <llfs/int_types.hpp>
 #include <llfs/log_device.hpp>
+#include <llfs/metrics.hpp>
 #include <llfs/optional.hpp>
 #include <llfs/packed_array.hpp>
 #include <llfs/packed_page_id.hpp>
@@ -27,6 +28,7 @@
 #include <llfs/simple_packed_type.hpp>
 #include <llfs/slot_lock_manager.hpp>
 #include <llfs/slot_read_lock.hpp>
+#include <llfs/slot_reader.hpp>
 #include <llfs/slot_writer.hpp>
 #include <llfs/uuid.hpp>
 
@@ -123,6 +125,32 @@ usize packed_sizeof_page_allocator_attach_slot() noexcept;
 
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 
+struct PageAllocatorMetrics {
+  CountMetric<u64> allocate_ok_count{0};
+  CountMetric<u64> allocate_error_count{0};
+  CountMetric<u64> deallocate_count{0};
+  CountMetric<u64> checkpoints_count{0};
+  CountMetric<u64> checkpoint_slots_count{0};
+
+  //+++++++++++-+-+--+----- --- -- -  -  -   -
+
+  /** \brief Exports all collectors in this object to the passed registry, adding the passed labels.
+   *
+   * IMPORTANT: Once export_to has been called, this->unexport_from(registry) must be called before
+   * this object goes out of scope!
+   */
+  void export_to(MetricRegistry& registry, const MetricLabelSet& labels) noexcept;
+
+  /** \brief Removes all previously exported collectors associated with this object from the passed
+   * registry.
+   */
+  void unexport_from(MetricRegistry& registry) noexcept;
+};
+
+std::ostream& operator<<(std::ostream& out, const PageAllocatorMetrics& t);
+
+//=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
+
 class PageAllocatorState
 {
  public:
@@ -181,8 +209,8 @@ class PageAllocatorState
 
   //----- --- -- -  -  -   -
 
-  explicit PageAllocatorState(const PageIdFactory& page_ids,
-                              SlotLockManager* trim_control) noexcept;
+  explicit PageAllocatorState(const PageIdFactory& page_ids, SlotLockManager* trim_control,
+                              PageAllocatorMetrics& metrics) noexcept;
 
   //----- --- -- -  -  -   -
 
@@ -251,6 +279,10 @@ class PageAllocatorState
 
   //----- --- -- -  -  -   -
 
+  /** \brief Reference to metrics object owned by the PageAllocator.
+   */
+  PageAllocatorMetrics& metrics;
+
   const PageIdFactory page_ids;
 
   /** \brief When true, update is being passed recovered slot data; otherwise, update is receiving
@@ -269,12 +301,17 @@ class PageAllocatorState
   SlotLockManager* trim_control;
 };
 
+std::ostream& operator<<(std::ostream& out, const PageAllocatorState::CheckpointInfo& t);
+
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 //
 class PageAllocator
 {
  public:
+  static constexpr u64 kCheckpointTargetSizeLog2 = 12;
   static constexpr u64 kCheckpointTargetSize = 4 * kKiB;
+
+  static_assert((u64{1} << kCheckpointTargetSizeLog2) == kCheckpointTargetSize);
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -290,6 +327,10 @@ class PageAllocator
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
+  /** \brief Notifies this object that halt is coming.
+   */
+  void pre_halt() noexcept;
+
   /** \brief Requests shutdown of all background tasks for this PageAllocator.
    */
   void halt() noexcept;
@@ -297,6 +338,31 @@ class PageAllocator
   /** \brief Blocks until all background tasks have completed.
    */
   void join() noexcept;
+
+  /** \brief Returns a const reference to the diagnostic metrics for this object.
+   */
+  const PageAllocatorMetrics& metrics() const noexcept
+  {
+    return this->metrics_;
+  }
+
+  /** \brief Returns the number of bytes currently in the LogDevice for this allocator.
+   */
+  u64 log_size() const noexcept
+  {
+    return this->log_device_->size();
+  }
+
+  /** \brief Returns the configured size of the LogDevice for this allocator.
+   */
+  u64 log_capacity() const noexcept
+  {
+    return this->log_device_->capacity();
+  }
+
+  /** \brief Returns the target checkpoint grant pool size for the current configuration.
+   */
+  usize get_target_checkpoint_grant_pool_size() const noexcept;
 
   //----- --- -- -  -  -   -
 
@@ -406,10 +472,6 @@ class PageAllocator
    */
   void checkpoint_task_main() noexcept;
 
-  /** \brief Returns the target checkpoint grant pool size for the current configuration.
-   */
-  usize get_target_checkpoint_grant_pool_size() const noexcept;
-
   /** \brief Common implementation for attach_user and detach_user.
    */
   template <typename AttachEventT>
@@ -423,9 +485,13 @@ class PageAllocator
   /** \brief Runs in the background, scanning durable log segments looking for newly freed pages to
    * replentish the free page pool.
    */
-  void free_page_task_main(slot_offset_type recovered_slot_upper_bound) noexcept;
+  void free_page_task_main() noexcept;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
+
+  // Diagnostic metrics.
+  //
+  PageAllocatorMetrics metrics_;
 
   // Name for this object.
   //
@@ -438,6 +504,10 @@ class PageAllocator
   // The maximum number of configured client attachments.
   //
   const u64 max_attachments_;
+
+  // Set by this->pre_halt(); controls verbosity of errors that might be logged during halt.
+  //
+  std::atomic<bool> halt_expected_{false};
 
   // On recover, set to the number of attached users.  Attached users should call
   // `notify_user_recovered` to indicate that they are now in a clean state; when the last of
@@ -490,6 +560,10 @@ class PageAllocator
   //
   boost::dynamic_bitset<> durable_page_in_use_;
 
+  std::unique_ptr<LogDevice::Reader> free_page_log_reader_;
+
+  Optional<TypedSlotReader<PackedPageAllocatorEvent>> free_page_slot_reader_;
+
   // Background free page task.
   //
   Optional<batt::Task> free_page_task_;
@@ -535,8 +609,15 @@ inline StatusOr<SlotReadLock> PageAllocator::update_page_ref_counts(
   const usize payload_size = packed_sizeof_page_allocator_txn(new_ref_counts.size());
   const usize slot_size = packed_sizeof_slot_with_payload_size(payload_size);
 
-  BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant,
-                        this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue));
+  BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant, ([this, slot_size] {
+                          BATT_DEBUG_INFO("[PageAllocator] waiting for update grant;"
+                                          << BATT_INSPECT(this->update_grant_.size())
+                                          << BATT_INSPECT(this->checkpoint_grant_pool_.size())
+                                          << BATT_INSPECT(this->slot_writer_.pool_size())
+                                          << BATT_INSPECT(this->slot_writer_.in_use_size()));
+
+                          return this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue);
+                        }()));
 
   // This should be a no-op, but make sure we return the slot grant to the update grant pool and not
   // the default log pool maintained by the slot writer.
@@ -622,8 +703,15 @@ inline StatusOr<slot_offset_type> PageAllocator::process_attach_event(const Atta
   const usize payload_size = packed_sizeof(event);
   const usize slot_size = packed_sizeof_slot_with_payload_size(payload_size);
 
-  BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant,
-                        this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue));
+  BATT_ASSIGN_OK_RESULT(batt::Grant slot_grant, ([this, slot_size] {
+                          BATT_DEBUG_INFO("[PageAllocator] waiting for update grant;"
+                                          << BATT_INSPECT(this->update_grant_.size())
+                                          << BATT_INSPECT(this->checkpoint_grant_pool_.size())
+                                          << BATT_INSPECT(this->slot_writer_.pool_size())
+                                          << BATT_INSPECT(this->slot_writer_.in_use_size()));
+
+                          return this->update_grant_.spend(slot_size, batt::WaitForResource::kTrue);
+                        }()));
 
   // Return any unused part of the slot grant to the update grant pool; _not_ the default log pool
   // maintained by the slot writer.

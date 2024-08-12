@@ -139,6 +139,9 @@ bool initialize_status_codes()
       CODE_WITH_MSG_(StatusCode::kLogDeviceV1Deprecated,
                      "IoRingLogDevice (aka LogDevice storage object) has been deprecated; use "
                      "IoRingLogDevice2/LogDevice2 instead"),  // 66,
+      CODE_WITH_MSG_(
+          StatusCode::kPageAllocatorInitRefCountTooSmall,
+          "The initial reference count for new page is too small (must be at least 2)"),  // 67,
   });
   return initialized;
 }

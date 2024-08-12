@@ -8,9 +8,12 @@
 
 #include <llfs/page_allocator2.hpp>
 //
-#include <llfs/slot_reader.hpp>
 
+#include <batteries/operators.hpp>
 #include <batteries/stream_util.hpp>
+#include <batteries/utility.hpp>
+
+#include <boost/preprocessor/stringize.hpp>
 
 namespace llfs {
 namespace experimental {
@@ -118,14 +121,62 @@ StatusOr<const PackedPageAllocatorTxn&> unpack_object(const PackedPageAllocatorT
   return obj;
 }
 
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+BATT_OBJECT_PRINT_IMPL((), PageAllocatorState::CheckpointInfo,
+                       (checkpoint_slots,  //
+                        trim_target        //
+                        ))
+
+//=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
+// class PageAllocatorMetrics
+
+BATT_OBJECT_PRINT_IMPL((), PageAllocatorMetrics,
+                       (allocate_ok_count,      //
+                        allocate_error_count,   //
+                        deallocate_count,       //
+                        checkpoints_count,      //
+                        checkpoint_slots_count  //
+                        ))
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocatorMetrics::export_to(MetricRegistry& registry,
+                                     const MetricLabelSet& labels) noexcept
+{
+#define LLFS_EXPORT_METRIC_(name)                                                                  \
+  registry.add(BOOST_PP_STRINGIZE(name), this->name, batt::make_copy(labels))
+
+  LLFS_EXPORT_METRIC_(allocate_ok_count);
+  LLFS_EXPORT_METRIC_(allocate_error_count);
+  LLFS_EXPORT_METRIC_(deallocate_count);
+  LLFS_EXPORT_METRIC_(checkpoints_count);
+  LLFS_EXPORT_METRIC_(checkpoint_slots_count);
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocatorMetrics::unexport_from(MetricRegistry& registry) noexcept
+{
+  registry                                   //
+      .remove(this->allocate_ok_count)       //
+      .remove(this->allocate_error_count)    //
+      .remove(this->deallocate_count)        //
+      .remove(this->checkpoints_count)       //
+      .remove(this->checkpoint_slots_count)  //
+      ;
+}
+
 //=#=#==#==#===============+=+=+=+=++=++++++++++++++-++-+--+-+----+---------------
 // class PageAllocatorState
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 /*explicit*/ PageAllocatorState::PageAllocatorState(const PageIdFactory& page_ids,
-                                                    SlotLockManager* trim_control) noexcept
-    : page_ids{page_ids}
+                                                    SlotLockManager* trim_control,
+                                                    PageAllocatorMetrics& metrics) noexcept
+    : metrics{metrics}
+    , page_ids{page_ids}
     , in_recovery_mode{true}
     , pending_recovery{}
     , attach_state{}
@@ -289,6 +340,8 @@ StatusOr<PageAllocatorState::CheckpointInfo> PageAllocatorState::append_checkpoi
     LogDevice::Reader& log_reader, batt::Grant& grant,
     TypedSlotWriter<PackedPageAllocatorEvent>& slot_writer)
 {
+  this->metrics.checkpoints_count.add(1);
+
   CheckpointInfo info;
 
   TypedSlotWriter<PackedPageAllocatorEvent>::MultiAppend multi_append{slot_writer};
@@ -316,10 +369,11 @@ StatusOr<PageAllocatorState::CheckpointInfo> PageAllocatorState::append_checkpoi
     if (!new_slot.ok()) {
       if (new_slot.status() == ::llfs::make_status(StatusCode::kSlotGrantTooSmall)) {
         return batt::StatusCode::kLoopBreak;
-      } else {
-        return new_slot.status();
       }
+      return new_slot.status();
     }
+
+    this->metrics.checkpoint_slots_count.add(1);
 
     return this->update(new_slot->slot, *new_slot->payload);
   };
@@ -437,7 +491,7 @@ Status PageAllocatorState::validate_and_apply_ref_count_deltas(
         // When first writing a new page, we must increase ref count by at least 2.
         //
         if (old_state.ref_count == 0 && new_ref_count < 2) {
-          return batt::StatusCode::kInvalidArgument;
+          return ::llfs::make_status(StatusCode::kPageAllocatorInitRefCountTooSmall);
         }
 
       } else {
@@ -463,8 +517,8 @@ Status PageAllocatorState::validate_and_apply_ref_count_deltas(
 /*static*/ u64 PageAllocator::calculate_log_size(PageCount physical_page_count,
                                                  MaxAttachments max_attachments)
 {
-  return 2 *
-         batt::round_up_bits(12, PageAllocator::kCheckpointTargetSize +
+  return 2 * batt::round_up_bits(PageAllocator::kCheckpointTargetSizeLog2,
+                                 PageAllocator::kCheckpointTargetSize +
                                      physical_page_count * packed_sizeof_page_ref_count_slot() +
                                      max_attachments * packed_sizeof_page_allocator_attach_slot());
 }
@@ -490,13 +544,13 @@ Status PageAllocatorState::validate_and_apply_ref_count_deltas(
   //
   BATT_ASSIGN_OK_RESULT(SlotRange recovered_slot_range, page_allocator->recover_impl());
 
-  // Start background compaction task.
-  //
-  page_allocator->start_checkpoint_task(options.scheduler);
-
   // Start the free page task.
   //
   page_allocator->start_free_page_task(options.scheduler, recovered_slot_range.upper_bound);
+
+  // Start background compaction task.
+  //
+  page_allocator->start_checkpoint_task(options.scheduler);
 
   // Success!
   //
@@ -510,6 +564,10 @@ StatusOr<SlotRange> PageAllocator::recover_impl()
   Optional<SlotReadLock> tmp_slot_lock;
 
   batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+  auto on_scope_exit = batt::finally([&] {
+    locked_state->in_recovery_mode = false;
+  });
 
   const i64 physical_page_count =
       BATT_CHECKED_CAST(i64, this->page_ids_.get_physical_page_count().value());
@@ -683,7 +741,8 @@ StatusOr<SlotRange> PageAllocator::recover_impl()
 PageAllocator::PageAllocator(std::string&& name, const PageIdFactory& page_ids, u64 max_attachments,
                              std::unique_ptr<LogDevice>&& log_device,
                              std::unique_ptr<SlotLockManager>&& trim_control) noexcept
-    : name_{std::move(name)}
+    : metrics_{}
+    , name_{std::move(name)}
     , page_ids_{page_ids}
     , max_attachments_{max_attachments}
     , recovering_user_count_{1}
@@ -692,7 +751,7 @@ PageAllocator::PageAllocator(std::string&& name, const PageIdFactory& page_ids, 
     , log_device_{std::move(log_device)}
     , trim_control_{std::move(trim_control)}
     , slot_writer_{*this->log_device_}
-    , state_{this->page_ids_, this->trim_control_.get()}
+    , state_{this->page_ids_, this->trim_control_.get(), this->metrics_}
     , checkpoint_grant_pool_{BATT_OK_RESULT_OR_PANIC(
           this->slot_writer_.reserve(0, batt::WaitForResource::kFalse))}
     , update_grant_{BATT_OK_RESULT_OR_PANIC(
@@ -701,6 +760,15 @@ PageAllocator::PageAllocator(std::string&& name, const PageIdFactory& page_ids, 
 {
   BATT_CHECK(this->free_pool_.is_lock_free());
   this->free_pool_.reserve(this->page_ids_.get_physical_page_count());
+
+  // Register all metrics.
+  //
+  MetricLabelSet labels{
+      MetricLabel{Token{"object_type"}, Token{"llfs_PageAllocator"}},
+      MetricLabel{Token{"name"}, Token{this->name_}},
+  };
+
+  this->metrics_.export_to(global_metric_registry(), labels);
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -709,18 +777,31 @@ PageAllocator::~PageAllocator() noexcept
 {
   this->halt();
   this->join();
+
+  this->metrics_.unexport_from(global_metric_registry());
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocator::pre_halt() noexcept
+{
+  this->halt_expected_.store(true);
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 void PageAllocator::halt() noexcept
 {
+  this->pre_halt();
   this->recovering_user_count_.close();
   this->free_pool_push_count_.close();
   this->log_device_->halt();
   this->trim_control_->halt();
   this->slot_writer_.halt();
   this->update_grant_.revoke();
+  if (this->free_page_slot_reader_) {
+    this->free_page_slot_reader_->halt();
+  }
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -847,6 +928,7 @@ StatusOr<PageId> PageAllocator::allocate_page(batt::WaitForResource wait_for_res
     {
       PageId page_id;
       if (this->free_pool_.pop(page_id)) {
+        this->metrics_.allocate_ok_count.add(1);
         return page_id;
       }
     }
@@ -855,6 +937,7 @@ StatusOr<PageId> PageAllocator::allocate_page(batt::WaitForResource wait_for_res
       LLFS_LOG_INFO_FIRST_N(1) << "Unable to allocate page (pool is empty)"
                                << "; device=" << this->page_ids_.get_device_id();
 
+      this->metrics_.allocate_error_count.add(1);
       return {batt::StatusCode::kResourceExhausted};
     }
 
@@ -879,6 +962,8 @@ StatusOr<PageId> PageAllocator::allocate_page(batt::WaitForResource wait_for_res
 //
 void PageAllocator::deallocate_page(PageId page_id)
 {
+  this->metrics_.deallocate_count.add(1);
+
   const bool success = this->free_pool_.push(page_id);
   BATT_CHECK(success);
 
@@ -952,6 +1037,9 @@ StatusOr<PageRefCount> PageAllocator::get_ref_count(PhysicalPageId physical_page
 //
 void PageAllocator::start_checkpoint_task(batt::TaskScheduler& scheduler)
 {
+  BATT_CHECK_NOT_NULLPTR(this->free_page_log_reader_)
+      << "start_free_page_task must be called before start_checkpoint_task";
+  BATT_CHECK_NE(this->free_page_slot_reader_, None);
   BATT_CHECK_EQ(this->checkpoint_task_, None);
 
   this->checkpoint_task_.emplace(
@@ -961,22 +1049,6 @@ void PageAllocator::start_checkpoint_task(batt::TaskScheduler& scheduler)
       },
       /*name=*/
       batt::to_string("PageAllocator{", batt::c_str_literal(this->name_), "}::checkpoint_task"));
-}
-
-//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
-//
-void PageAllocator::start_free_page_task(batt::TaskScheduler& scheduler,
-                                         slot_offset_type recovered_slot_upper_bound)
-{
-  BATT_CHECK_EQ(this->free_page_task_, None);
-
-  this->free_page_task_.emplace(
-      scheduler.schedule_task(),
-      [this, recovered_slot_upper_bound]() mutable {
-        this->free_page_task_main(recovered_slot_upper_bound);
-      },
-      /*name=*/
-      batt::to_string("PageAllocator{", batt::c_str_literal(this->name_), "}::free_page_task"));
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -992,9 +1064,15 @@ void PageAllocator::checkpoint_task_main() noexcept
       std::unique_ptr<LogDevice::Reader> log_reader =
           this->log_device_->new_reader(/*slot_lower_bound=*/None, LogReadMode::kSpeculative);
 
+      LLFS_VLOG(1) << "[PageAllocator::checkpoint_task] waiting for log to grow;"
+                   << BATT_INSPECT(log_reader->slot_offset());
+
       BATT_REQUIRE_OK(log_reader->await(BytesAvailable{
           .size = target_checkpoint_grant_pool_size + PageAllocator::kCheckpointTargetSize,
       }));
+
+      LLFS_VLOG(1) << "[PageAllocator::checkpoint_task]" << BATT_INSPECT(this->log_device_->size())
+                   << BATT_INSPECT(this->checkpoint_grant_pool_.size());
 
       // Spend some of the checkpoint grant pool to write new checkpoints.
       //
@@ -1003,6 +1081,8 @@ void PageAllocator::checkpoint_task_main() noexcept
 
       BATT_REQUIRE_OK(checkpoint_grant);
 
+      LLFS_VLOG(1) << "[PageAllocator::checkpoint_task] writing checkpoint";
+
       // Append checkpoint slots to the log.
       //
       auto checkpoint_info = [&]() -> StatusOr<PageAllocatorState::CheckpointInfo> {
@@ -1010,6 +1090,9 @@ void PageAllocator::checkpoint_task_main() noexcept
 
         return locked_state->append_checkpoint(*log_reader, *checkpoint_grant, this->slot_writer_);
       }();
+
+      LLFS_VLOG(1) << "[PageAllocator::checkpoint_task]" << BATT_INSPECT(checkpoint_info)
+                   << BATT_INSPECT(this->metrics_);
 
       BATT_REQUIRE_OK(checkpoint_info);
 
@@ -1031,20 +1114,32 @@ void PageAllocator::checkpoint_task_main() noexcept
       const slot_offset_type slot_upper_bound =
           this->log_device_->slot_range(LogReadMode::kDurable).upper_bound;
 
+      const auto new_lock_range = SlotRange{
+          .lower_bound = checkpoint_info->trim_target,
+          .upper_bound = slot_upper_bound,
+      };
+
+      LLFS_VLOG(1) << "[PageAllocator::checkpoint_task] updating checkpoint_trim_lock_; "
+                   << this->checkpoint_trim_lock_.slot_range() << " -> " << new_lock_range;
+
       BATT_ASSIGN_OK_RESULT(
           this->checkpoint_trim_lock_,
-          this->trim_control_->update_lock(std::move(this->checkpoint_trim_lock_),
-                                           SlotRange{
-                                               .lower_bound = checkpoint_info->trim_target,
-                                               .upper_bound = slot_upper_bound,
-                                           },
+          this->trim_control_->update_lock(std::move(this->checkpoint_trim_lock_), new_lock_range,
                                            "PageAllocator::checkpoint_task_main"));
+
+      LLFS_VLOG(1) << "[PageAllocator::checkpoint_task]"
+                   << BATT_INSPECT(this->trim_control_->debug_info());
 
       for (;;) {
         // Trim as much as we can (this may be limited by outstanding slot read locks from active
         // txns).
         //
         const slot_offset_type trim_pos = this->trim_control_->get_lower_bound();
+
+        // Wait for the free page reader task to catch up to the trim point.
+        //
+        BATT_REQUIRE_OK(this->free_page_slot_reader_->await_consumed_upper_bound(trim_pos));
+
         StatusOr<batt::Grant> trimmed = this->slot_writer_.trim_and_reserve(trim_pos);
         BATT_REQUIRE_OK(trimmed);
 
@@ -1072,6 +1167,12 @@ void PageAllocator::checkpoint_task_main() noexcept
             break;
           }
 
+          BATT_DEBUG_INFO("[PageAllocator::checkpoint_task] awaiting slot read lock release;"
+                          << BATT_INSPECT(deficit) << BATT_INSPECT(trim_pos)
+                          << BATT_INSPECT(target_checkpoint_grant_pool_size)
+                          << BATT_INSPECT(this->checkpoint_grant_pool_.size())
+                          << BATT_INSPECT(this->trim_control_->debug_info()));
+
           BATT_REQUIRE_OK(this->trim_control_->await_lower_bound(trim_pos + deficit));
 
           // Try again now that released slot locks have allowed us to trim more.
@@ -1082,13 +1183,43 @@ void PageAllocator::checkpoint_task_main() noexcept
     }
   }();
 
-  LLFS_VLOG(1) << BATT_INSPECT(status);
+  if (this->halt_expected_.load()) {
+    LLFS_VLOG(1) << BATT_INSPECT(status);
+  } else {
+    LLFS_LOG_WARNING() << BATT_INSPECT(status);
+  }
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-void PageAllocator::free_page_task_main(slot_offset_type recovered_slot_upper_bound) noexcept
+void PageAllocator::start_free_page_task(batt::TaskScheduler& scheduler,
+                                         slot_offset_type recovered_slot_upper_bound)
 {
+  BATT_CHECK_EQ(this->free_page_log_reader_, nullptr);
+  BATT_CHECK_EQ(this->free_page_slot_reader_, None);
+  BATT_CHECK_EQ(this->free_page_task_, None);
+
+  this->free_page_log_reader_ =
+      this->log_device_->new_reader(recovered_slot_upper_bound, LogReadMode::kDurable);
+
+  this->free_page_slot_reader_.emplace(*this->free_page_log_reader_);
+
+  this->free_page_task_.emplace(
+      scheduler.schedule_task(),
+      [this]() mutable {
+        this->free_page_task_main();
+      },
+      /*name=*/
+      batt::to_string("PageAllocator{", batt::c_str_literal(this->name_), "}::free_page_task"));
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocator::free_page_task_main() noexcept
+{
+  BATT_CHECK_NOT_NULLPTR(this->free_page_log_reader_);
+  BATT_CHECK_NE(this->free_page_slot_reader_, None);
+
   Status status = [&]() -> Status {
     // Helper function - given a PackedPageRefCount, update the `durable_page_in_use_` bit set and
     // push newly freed pages onto `this->free_pool_`.
@@ -1122,12 +1253,7 @@ void PageAllocator::free_page_task_main(slot_offset_type recovered_slot_upper_bo
     // Do a blocking read of all durable Txn and Page Ref Count events as they are appended to the
     // log and flushed.
     //
-    std::unique_ptr<LogDevice::Reader> log_reader =
-        this->log_device_->new_reader(recovered_slot_upper_bound, LogReadMode::kDurable);
-
-    TypedSlotReader<PackedPageAllocatorEvent> slot_reader{*log_reader};
-
-    BATT_REQUIRE_OK(slot_reader.run(
+    BATT_REQUIRE_OK(this->free_page_slot_reader_->run(
         batt::WaitForResource::kTrue,
         //----- --- -- -  -  -   -
         [&](const SlotParse& /*slot*/, const PackedPageAllocatorTxn& txn) -> Status {
@@ -1153,15 +1279,21 @@ void PageAllocator::free_page_task_main(slot_offset_type recovered_slot_upper_bo
     return OkStatus();
   }();
 
-  LLFS_VLOG(1) << BATT_INSPECT(status);
+  if (this->halt_expected_.load()) {
+    LLFS_VLOG(1) << BATT_INSPECT(status);
+  } else {
+    LLFS_LOG_WARNING() << BATT_INSPECT(status);
+  }
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 usize PageAllocator::get_target_checkpoint_grant_pool_size() const noexcept
 {
-  return this->page_ids_.get_physical_page_count() * packed_sizeof_page_ref_count_slot() +
-         this->max_attachments_ * packed_sizeof_page_allocator_attach_slot();
+  return batt::round_up_bits(
+      PageAllocator::kCheckpointTargetSizeLog2,
+      this->page_ids_.get_physical_page_count() * packed_sizeof_page_ref_count_slot() +
+          this->max_attachments_ * packed_sizeof_page_allocator_attach_slot());
 }
 
 }  //namespace experimental
