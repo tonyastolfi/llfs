@@ -569,9 +569,6 @@ StatusOr<SlotRange> PageAllocator::recover_impl()
     locked_state->in_recovery_mode = false;
   });
 
-  const i64 physical_page_count =
-      BATT_CHECKED_CAST(i64, this->page_ids_.get_physical_page_count().value());
-
   SlotRange checkpoint_lock_range{
       .lower_bound = 0,
       .upper_bound = 0,
@@ -696,29 +693,17 @@ StatusOr<SlotRange> PageAllocator::recover_impl()
     }
   }
 
-  // Populate the free pool.
-  //
-  {
-    usize push_count = 0;
-    this->durable_page_in_use_.resize(physical_page_count, false);
-    for (i64 physical_page = 0; physical_page < physical_page_count; ++physical_page) {
-      PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
-      if (page_state.ref_count == 0) {
-        const PageId page_id = this->page_ids_.make_page_id(physical_page, page_state.generation);
-        BATT_CHECK(this->free_pool_.unsynchronized_push(page_id));
-        ++push_count;
-      } else {
-        this->durable_page_in_use_.set(physical_page, true);
-      }
-    }
-    this->free_pool_push_count_.fetch_add(push_count);
-  }
-
   // Update recovering_user_count_; remove the initial count of 1 only after increasing by the
   // number of attachments found.
   //
   this->recovering_user_count_.fetch_add(locked_state->attach_state.size());
   this->recovering_user_count_.fetch_sub(1);
+
+  // Initialize the free pool if there are no attached users that need to run recovery.
+  //
+  if (this->recovering_user_count_.get_value() == 0) {
+    this->init_free_page_pool(locked_state);
+  }
 
   // Cross-check the attach_state and pending_recovery maps.
   //
@@ -757,6 +742,10 @@ PageAllocator::PageAllocator(std::string&& name, const PageIdFactory& page_ids, 
     , update_grant_{BATT_OK_RESULT_OR_PANIC(
           this->slot_writer_.reserve(0, batt::WaitForResource::kFalse))}
     , checkpoint_task_{None}
+    , durable_page_in_use_(this->page_ids_.get_physical_page_count())
+    , free_page_log_reader_{nullptr}
+    , free_page_slot_reader_{None}
+    , free_page_task_{None}
 {
   BATT_CHECK(this->free_pool_.is_lock_free());
   this->free_pool_.reserve(this->page_ids_.get_physical_page_count());
@@ -847,6 +836,7 @@ StatusOr<std::map<slot_offset_type, SlotReadLock>> PageAllocator::get_pending_re
 //
 Status PageAllocator::notify_user_recovered(const boost::uuids::uuid& user_id)
 {
+  const bool all_users_recovered = (this->recovering_user_count_.get_value() == 1);
   {
     batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
 
@@ -865,11 +855,43 @@ Status PageAllocator::notify_user_recovered(const boost::uuids::uuid& user_id)
     // We no longer need to track this user's recovery state.
     //
     locked_state->pending_recovery.erase(iter);
+
+    BATT_CHECK_EQ(all_users_recovered, locked_state->pending_recovery.empty());
+
+    if (all_users_recovered) {
+      this->init_free_page_pool(locked_state);
+    }
   }
+
   const i64 prior_count = this->recovering_user_count_.fetch_sub(1);
   BATT_CHECK_GT(prior_count, 0);
+  BATT_CHECK_EQ(all_users_recovered, prior_count == 1) << BATT_INSPECT(prior_count);
 
   return OkStatus();
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageAllocator::init_free_page_pool(batt::ScopedLock<PageAllocatorState>& locked_state) noexcept
+{
+  usize push_count = 0;
+
+  const i64 physical_page_count =
+      BATT_CHECKED_CAST(i64, this->page_ids_.get_physical_page_count().value());
+
+  for (i64 physical_page = 0; physical_page < physical_page_count; ++physical_page) {
+    PageAllocatorState::PageState& page_state = locked_state->page_state[physical_page];
+    if (page_state.ref_count == 0) {
+      const PageId page_id = this->page_ids_.make_page_id(physical_page, page_state.generation);
+      BATT_CHECK_EQ(this->free_pool_.unsynchronized_push(page_id), true);
+      BATT_CHECK_EQ(this->durable_page_in_use_.test(physical_page), false);
+      ++push_count;
+    } else {
+      this->durable_page_in_use_.set(physical_page, true);
+    }
+  }
+
+  this->free_pool_push_count_.fetch_add(push_count);
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -1221,6 +1243,10 @@ void PageAllocator::free_page_task_main() noexcept
   BATT_CHECK_NE(this->free_page_slot_reader_, None);
 
   Status status = [&]() -> Status {
+    // First wait for all users to finish recovery.
+    //
+    BATT_REQUIRE_OK(this->require_users_recovered(batt::WaitForResource::kTrue));
+
     // Helper function - given a PackedPageRefCount, update the `durable_page_in_use_` bit set and
     // push newly freed pages onto `this->free_pool_`.
     //

@@ -461,6 +461,12 @@ class PageAllocator
    */
   StatusOr<SlotRange> recover_impl();
 
+  /** \brief Populates the free page pool; this must only be done once all users have notified the
+   * allocator that their recovery is complete, since their recovery process might involve updating
+   * ref counts (0 -> 2) for new pages that they have written.
+   */
+  void init_free_page_pool(batt::ScopedLock<PageAllocatorState>& locked_state) noexcept;
+
   /** \brief Starts the compaction task; must be called after recovery.
    */
   void start_checkpoint_task(batt::TaskScheduler& scheduler);

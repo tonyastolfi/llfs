@@ -259,7 +259,7 @@ TEST_F(PageAllocator2SimTest, UpdateRefCountsNoAttach)
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(1000)
       .n_updates(4)
-      .run(batt::StaticType<Scenario>{}, [&](Scenario& scenario) {
+      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         ASSERT_NO_FATAL_FAILURE(scenario.recover());
 
         StatusOr<llfs::SlotReadLock> update_status =
@@ -280,7 +280,7 @@ TEST_F(PageAllocator2SimTest, NewPageRefCountTooSmall)
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(100)
       .n_updates(4)
-      .run(batt::StaticType<Scenario>{}, [&](Scenario& scenario) {
+      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         ASSERT_NO_FATAL_FAILURE(scenario.recover());
         ASSERT_NO_FATAL_FAILURE(scenario.attach_user(scenario.user_id));
 
@@ -303,7 +303,7 @@ TEST_F(PageAllocator2SimTest, AllocatePages)
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(100 * 1000)
       .n_updates(4)
-      .run(batt::StaticType<Scenario>{}, [&](Scenario& scenario) {
+      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         // Keep track of expected page values.
         //
         std::map<llfs::PageId, i32> expected;
@@ -375,7 +375,7 @@ TEST_F(PageAllocator2SimTest, CheckpointAndTrim)
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(100 * 1000)
       .n_updates(25)
-      .run(batt::StaticType<Scenario>{}, [&](Scenario& scenario) {
+      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         ASSERT_GT(scenario.page_count, 2);
         ASSERT_LE(scenario.page_count, 64);
 
@@ -513,6 +513,28 @@ TEST_F(PageAllocator2SimTest, CheckpointAndTrim)
             ASSERT_GT(ref_count_updates.size(), 0);
           }
         }
+      });
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+TEST_F(PageAllocator2SimTest, MultiUserUpdates)
+{
+  llfs::testing::ScenarioRunner{}  //
+      .n_seeds(100 * 1000)
+      .n_updates(25)
+      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
+        (void)scenario;
+
+        // Plan:
+        //  - spawn N user tasks, that each:
+        //    1. attach to the page allocator
+        //    2. choose one of the following actions (if available):
+        //       - (try to) allocate 0 or more page(s), add 0 or more pages that are already known
+        //          by that user, write an update
+        //       - pin a page and share its id with another user
+        //       - drop a reference to an unpinned page
+        //
       });
 }
 
