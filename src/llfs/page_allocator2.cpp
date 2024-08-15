@@ -929,6 +929,15 @@ StatusOr<slot_offset_type> PageAllocator::detach_user(const boost::uuids::uuid& 
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
+bool PageAllocator::is_user_attached(const boost::uuids::uuid& user_id)
+{
+  batt::ScopedLock<PageAllocatorState> locked_state{this->state_};
+
+  return locked_state->attach_state.count(user_id) != 0;
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
 StatusOr<PageId> PageAllocator::allocate_page(batt::WaitForResource wait_for_resource,
                                               const batt::CancelToken& cancel_token)
 {

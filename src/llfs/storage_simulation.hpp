@@ -141,6 +141,13 @@ class StorageSimulation
     return this->entropy_source().pick_int(min_value, max_value);
   }
 
+  /** \brief Convenience: invokes this->entropy_source().pick_branch().
+   */
+  bool pick_branch() const
+  {
+    return this->entropy_source().pick_branch();
+  }
+
   /** \brief Returns a reference to the entropy source passed in at construction time.
    */
   batt::StateMachineEntropySource& entropy_source() noexcept
@@ -287,6 +294,19 @@ class StorageSimulation
   u64 current_step() const noexcept
   {
     return this->step_.get_value();
+  }
+
+  /** \brief Blocks the calling task until the simulation step has reached or exceeded the specified
+   * value.
+   *
+   * \return the new step value, or error code if the simulation was interrupted/ended before
+   * the target step was reached.
+   */
+  StatusOr<u64> await_step(u64 minimum_step) noexcept
+  {
+    return this->step_.await_true([minimum_step](u64 observed_step) {
+      return observed_step >= minimum_step;
+    });
   }
 
   /** \brief Returns true if all blocks for a given page are present in a simulated PageDevice,

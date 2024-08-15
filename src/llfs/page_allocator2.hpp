@@ -391,12 +391,20 @@ class PageAllocator
   /** \brief Adds `user_id` to the list of attached users for this allocator.  This list is used
    * during recovery to make sure that the allocator does not resume normal operation before each
    * user has had a chance to resolve any pending updates.
+   *
+   * \return the slot upper bound of the new attachment if successful, otherwise error status
    */
   StatusOr<slot_offset_type> attach_user(const boost::uuids::uuid& user_id);
 
   /** \brief Removes `user_id` from the attached user list.
+   *
+   * \return the slot upper bound of the detachment if successful, otherwise error status
    */
   StatusOr<slot_offset_type> detach_user(const boost::uuids::uuid& user_id);
+
+  /** \brief Returns true iff the passed `user_id` is attached to this allocator.
+   */
+  bool is_user_attached(const boost::uuids::uuid& user_id);
 
   //----- --- -- -  -  -   -
 
@@ -422,7 +430,7 @@ class PageAllocator
    * sequence, if that is the desired behavior.
    */
   template <typename PageRefCountSeq,  //
-            typename GarbageCollectFn = batt::DoNothing>
+            typename GarbageCollectFn = batt::DoNothing /* void (PageId) */>
   StatusOr<SlotReadLock> update_page_ref_counts(
       const boost::uuids::uuid& user_id,    //
       slot_offset_type user_slot,           //
