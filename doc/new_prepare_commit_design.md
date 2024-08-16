@@ -1,5 +1,11 @@
 # Proposal: Replicate Root Page Refs and User Data to Simply Job Txns and Trimming
 
+## Status
+
+(2024-08-16) This proposal was implemented in late 2023 and is
+currently in the main branch of LLFS.  It will be made obsolete by an
+upcoming revision to the page job protocol.
+
 ## Problem Statement
 
 Currently, a multi-page transaction ("job" from hereafter) is considered
