@@ -39,6 +39,7 @@ class PageAllocator2SimTest : public ::testing::Test
 {
  public:
   static constexpr usize kTestUserCount = 3;
+  static constexpr usize kTestMaxAttachments = kTestUserCount + 1;
   static constexpr usize kTestPageCount = 32;
   static constexpr usize kMaxUpdatesPerUser = 5;
 
@@ -281,7 +282,7 @@ class PageAllocator2SimTest : public ::testing::Test
 
     llfs::Optional<llfs::PageIdFactory> page_ids;
 
-    llfs::MaxAttachments max_attachments{4};
+    llfs::MaxAttachments max_attachments{kTestMaxAttachments};
 
     boost::uuids::uuid user_id = llfs::random_uuid();
 
@@ -504,7 +505,7 @@ void PageAllocator2SimTest::SimulatedUser::initialize(Scenario& scenario)
 
   this->index = user_i;
 
-  LLFS_LOG_INFO() << "Initializing user " << user_i;
+  LLFS_VLOG(1) << "Initializing user " << user_i;
 
   this->root_refs.resize(scenario.page_count, llfs::PageRefCount{
                                                   .page_id = llfs::PageId{},
@@ -520,7 +521,7 @@ void PageAllocator2SimTest::SimulatedUser::recover(Scenario& scenario)
 {
   const bool was_attached = this->attached;
   if (!this->attached) {
-    LLFS_LOG_INFO() << "User " << this->index << " not attached; attaching...";
+    LLFS_VLOG(1) << "User " << this->index << " not attached; attaching...";
 
     StatusOr<llfs::slot_offset_type> attach_slot =
         scenario.page_allocator->attach_user(this->user_id);
@@ -545,8 +546,8 @@ void PageAllocator2SimTest::SimulatedUser::recover(Scenario& scenario)
       ASSERT_FALSE(was_attached);
 
     } else {
-      LLFS_LOG_INFO() << "User " << this->index << " recovered " << recovered_txns->size()
-                      << " pending txns";
+      LLFS_VLOG(1) << "User " << this->index << " recovered " << recovered_txns->size()
+                   << " pending txns";
 
       for (auto& [slot_offset, slot_read_lock] : *recovered_txns) {
         ASSERT_LT(slot_offset, this->slots.size());
@@ -568,14 +569,14 @@ void PageAllocator2SimTest::SimulatedUser::recover(Scenario& scenario)
     }
   }
 
-  LLFS_LOG_INFO() << "User " << this->index << " finished recovery";
+  LLFS_VLOG(1) << "User " << this->index << " finished recovery";
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 void PageAllocator2SimTest::SimulatedUser::take_action(Scenario& scenario)
 {
-  LLFS_LOG_INFO() << "User " << this->index << ": take_action";
+  LLFS_VLOG(1) << "User " << this->index << ": take_action";
 
   // Allocate a slot for updates on this step.
   //
@@ -647,7 +648,7 @@ void PageAllocator2SimTest::SimulatedUser::take_action(Scenario& scenario)
 //
 void PageAllocator2SimTest::SimulatedUser::send_message(Scenario& scenario)
 {
-  LLFS_LOG_INFO() << "User " << this->index << ": send_message";
+  LLFS_VLOG(1) << "User " << this->index << ": send_message";
 
   const usize n_roots = this->root_count();
   const usize physical_page_to_send = this->nth_root_ref(scenario.sim.pick_int(0, n_roots - 1));
@@ -659,7 +660,7 @@ void PageAllocator2SimTest::SimulatedUser::send_message(Scenario& scenario)
   const llfs::PageRefCount& root_ref = this->root_refs[physical_page_to_send];
   BATT_CHECK_GT(root_ref.ref_count, 0);
 
-  LLFS_LOG_INFO() << " -- sending " << root_ref << ": " << this->index << " -> " << receiver_i;
+  LLFS_VLOG(1) << " -- sending " << root_ref << ": " << this->index << " -> " << receiver_i;
 
   this->lock_count[physical_page_to_send] += 1;
   receiver.inbox.emplace_back(SimulatedUserMessage{
@@ -672,13 +673,13 @@ void PageAllocator2SimTest::SimulatedUser::send_message(Scenario& scenario)
 //
 void PageAllocator2SimTest::SimulatedUser::read_message(Scenario& scenario)
 {
-  LLFS_LOG_INFO() << "User " << this->index << ": read_message";
+  LLFS_VLOG(1) << "User " << this->index << ": read_message";
 
   BATT_CHECK(!this->inbox.empty());
   const SimulatedUserMessage message = this->inbox.front();
   this->inbox.pop_front();
 
-  LLFS_LOG_INFO() << " -- received" << BATT_INSPECT(message.page_id);
+  LLFS_VLOG(1) << " -- received" << BATT_INSPECT(message.page_id);
 
   BATT_CHECK(!this->slots.empty());
   SimulatedUserSlot& slot = this->slots.back();
@@ -713,7 +714,7 @@ void PageAllocator2SimTest::SimulatedUser::read_message(Scenario& scenario)
 //
 void PageAllocator2SimTest::SimulatedUser::update_refs(Scenario& scenario)
 {
-  LLFS_LOG_INFO() << "User " << this->index << ": update_refs";
+  LLFS_VLOG(1) << "User " << this->index << ": update_refs";
 
   BATT_CHECK(!this->slots.empty());
   SimulatedUserSlot& slot = this->slots.back();
@@ -721,7 +722,7 @@ void PageAllocator2SimTest::SimulatedUser::update_refs(Scenario& scenario)
   PageSet update_set = PageSet::pick_random(scenario.page_count, scenario.sim)  //
                            .intersect_with(this->root_pages());
 
-  LLFS_LOG_INFO() << " --" << BATT_INSPECT(update_set.size());
+  LLFS_VLOG(1) << " --" << BATT_INSPECT(update_set.size());
 
   while (!update_set.empty()) {
     const usize physical_page = update_set.pop();
@@ -751,8 +752,8 @@ void PageAllocator2SimTest::SimulatedUser::update_refs(Scenario& scenario)
 
 void PageAllocator2SimTest::SimulatedUser::recycle_pages(Scenario& scenario)
 {
-  LLFS_LOG_INFO() << "User " << this->index << ": recycle_pages; dead_pages["
-                  << this->dead_pages.size() << "] == " << batt::dump_range(this->dead_pages);
+  LLFS_VLOG(1) << "User " << this->index << ": recycle_pages; dead_pages["
+               << this->dead_pages.size() << "] == " << batt::dump_range(this->dead_pages);
 
   BATT_CHECK(!this->slots.empty());
   SimulatedUserSlot& slot = this->slots.back();
@@ -776,13 +777,13 @@ void PageAllocator2SimTest::SimulatedUser::recycle_pages(Scenario& scenario)
 //
 void PageAllocator2SimTest::SimulatedUser::new_pages(Scenario& scenario)
 {
-  LLFS_LOG_INFO() << "User " << this->index << ": new_pages";
+  LLFS_VLOG(1) << "User " << this->index << ": new_pages";
 
   BATT_CHECK(!this->slots.empty());
   SimulatedUserSlot& slot = this->slots.back();
 
   const usize n_pages = scenario.sim.pick_int(1, 5);
-  LLFS_LOG_INFO() << " --" << BATT_INSPECT(n_pages);
+  LLFS_VLOG(1) << " --" << BATT_INSPECT(n_pages);
 
   for (usize i = 0; i < n_pages; ++i) {
     StatusOr<llfs::PageId> new_page_id =
@@ -792,7 +793,7 @@ void PageAllocator2SimTest::SimulatedUser::new_pages(Scenario& scenario)
       if (new_page_id.status() != batt::StatusCode::kResourceExhausted) {
         this->set_error(new_page_id.status());
       } else {
-        LLFS_LOG_INFO() << " -- out of pages (skipping new_pages)";
+        LLFS_VLOG(1) << " -- out of pages (skipping new_pages)";
       }
       return;
     }
@@ -821,8 +822,8 @@ void PageAllocator2SimTest::SimulatedUser::commit_slot(Scenario& scenario,
   BATT_CHECK_LT(user_slot, this->slots.size());
   SimulatedUserSlot& slot = this->slots[user_slot];
 
-  LLFS_LOG_INFO() << "User " << this->index << ": commit_slot; updates[" << slot.updates.size()
-                  << "] == " << batt::dump_range(slot.updates);
+  LLFS_VLOG(1) << "User " << this->index << ": commit_slot; updates[" << slot.updates.size()
+               << "] == " << batt::dump_range(slot.updates);
 
   StatusOr<llfs::SlotReadLock> update_slot = scenario.page_allocator->update_page_ref_counts(
       this->user_id, user_slot, llfs::as_seq(slot.updates),
