@@ -34,7 +34,7 @@ namespace llfs {
  *    CommittablePageCacheJob::from.
  * 2.
  */
-class CommittablePageCacheJob
+class CommittablePageCacheJob  // TODO [tastolfi 2024-08-16] rename: PageJobCommitter?
 {
  public:
   //+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -150,7 +150,8 @@ class CommittablePageCacheJob
   struct DeviceUpdateState {
     std::vector<PageRefCount> ref_count_updates;
     const PageArena* p_arena = nullptr;
-    slot_offset_type sync_point = 0;
+    slot_offset_type sync_point =
+        0;  // TODO [tastolfi 2024-08-16] should this be Optional<slot_offset_type>?
   };
 
   struct PageRefCountUpdates {

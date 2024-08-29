@@ -293,7 +293,7 @@ During the Live phase of a page's lifecycle, the reference count may go up and d
 There are two ways a page can become dead:
 
 1. The last reference to the page is in a Volume root log that is trimmed, removing the reference
-2. The last reference to the page is in a dead page, which becomes free by being recycled
+2. The last reference to the page is in a dead page, which becomes Free by being recycled
 
 
 
@@ -307,7 +307,7 @@ There are two ways a page can become dead:
 
 ### Crash Model
 
-1. Every `PageDevice` has a _block size_, which must be a power of 2, independent of (though guaranteed not to be larger than) the page size for that device.  The page size must be a multiple of the block size.
+1. Every `PageDevice` has a _block size_, which must be a power of 2.  The device's page size must be a multiple (integer) of the block size.
 2. The _block size_ for a `PageDevice` is by definition the maximum write size considered atomic (writes will either succeed or fail, even on power loss; never partially succeed).
 3. The _block size_ for a `PageDeviec` is also by definition the minimum size and alignment when writing data to the underlying storage hardware for that device.
 4. All page writes to a `PageDevice` are considered as equivalent to some number of _block_-sized writes covering the same address extent on the hardware, performed in parallel.
