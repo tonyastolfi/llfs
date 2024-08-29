@@ -228,38 +228,77 @@ class PageAllocatorState
 
   //----- --- -- -  -  -   -
 
-  Status update(const SlotParse& slot, const PackedPageAllocatorAttach& attach) noexcept;
-  Status update(const SlotParse& slot, const PackedPageAllocatorDetach& detach) noexcept;
-  Status update(const SlotParse& slot, const PackedPageRefCount& ref_count) noexcept;
-  Status update(const SlotParse& slot, const PackedPageAllocatorTxn& txn) noexcept;
+  Status update(const SlotParse& slot, const PackedPageAllocatorAttach& attach,
+                bool in_recovery_mode) noexcept;
+  Status update(const SlotParse& slot, const PackedPageAllocatorDetach& detach,
+                bool in_recovery_mode) noexcept;
+  Status update(const SlotParse& slot, const PackedPageRefCount& ref_count,
+                bool in_recovery_mode) noexcept;
+  Status update(const SlotParse& slot, const PackedPageAllocatorTxn& txn,
+                bool in_recovery_mode) noexcept;
 
-  Status update_ref_count(slot_offset_type slot_upper_bound,
-                          const PackedPageRefCount& pprc) noexcept;
+  Status update_ref_count(slot_offset_type slot_upper_bound, const PackedPageRefCount& pprc,
+                          bool in_recovery_mode) noexcept;
+
+  /** \brief Runs sanity checks that should all pass once we have finished recovering slots from the
+   * log, returning OkStatus() or an error indicating the failed check.
+   */
+  Status validate_recovered_state(MaxAttachments max_attachments) const noexcept;
+
+  /** \brief Returns the slot locks for any pending txns for the given user.
+   */
+  StatusOr<std::map<slot_offset_type, SlotReadLock>> get_pending_recovery(
+      const boost::uuids::uuid& user_id) noexcept;
+
+  /** \brief Removes recovery state for the given user.
+   *
+   * \param user_id The user that is done with recovery
+   * \param all_users_recovered Must be set to true iff this is the final user to recover
+   */
+  Status notify_user_recovered(const boost::uuids::uuid& user_id,
+                               bool all_users_recovered) noexcept;
 
   /** \brief Returns true iff the ref count for `page_id` has not been updated/refreshed at a slot
    * greater than `slot_upper_bound`.
    */
-  bool updated_since(slot_offset_type slot_upper_bound, PageId page_id) const noexcept;
+  bool is_live_at_slot(slot_offset_type slot_upper_bound, PageId page_id) const noexcept;
 
-  /** \brief Returns true if `user_id` is attached and its `last_update` slot (upper bound) is
-   * greater than `slot_upper_bound` *OR* if `user_id` is _not_ attached.
+  /** \brief Returns true if `user_id` is attached and the attachment has not been updated/refreshed
+   * at a slot greater than `slot_upper_bound`.
    */
-  bool updated_since(slot_offset_type slot_upper_bound,
-                     const boost::uuids::uuid& user_id) const noexcept;
+  bool is_live_at_slot(slot_offset_type slot_upper_bound,
+                       const boost::uuids::uuid& user_id) const noexcept;
 
-  PageState* get_page_state(PageId page_id) noexcept;
+  /** \brief Populates the free page pool; this must only be done once all users have notified the
+   * allocator that their recovery is complete, since their recovery process might involve updating
+   * ref counts (0 -> 2) for new pages that they have written.
+   *
+   * \return the number of pages added to the free pool
+   */
+  usize init_free_page_pool(boost::lockfree::stack<PageId>& free_pool,
+                            boost::dynamic_bitset<>& durable_page_in_use) noexcept;
 
-  const PageState* get_page_state(PageId page_id) const noexcept;
+  /** \brief Returns the current ref count information for the given page.
+   */
+  StatusOr<i32> get_ref_count(PageId page_id) noexcept;
 
-  i32 get_ref_count(PageId page_id) const noexcept;
-
-  Status validate_page_id(PageId page_id) const noexcept;
+  /** \brief Returns the current PageId (which includes the current generation number and device id)
+   * and ref count for the given physical page.
+   */
+  StatusOr<PageRefCount> get_ref_count(PhysicalPageId physical_page) noexcept;
 
   /** \brief Returns true if the given `user_id` is attached.
    */
   bool is_user_attached(const boost::uuids::uuid& user_id) const noexcept
   {
-    return this->attach_state.count(user_id) != 0;
+    return this->attach_state_.count(user_id) != 0;
+  }
+
+  /** \brief Returns the number of attached users.
+   */
+  usize attached_user_count() const noexcept
+  {
+    return this->attach_state_.size();
   }
 
   /** \brief Consumes as much of `grant` as possible in order to append multiple checkpoint slots
@@ -278,27 +317,32 @@ class PageAllocatorState
       const Slice<PageRefCount>& ref_count_updates) const noexcept;
 
   //----- --- -- -  -  -   -
-
+ private:
   /** \brief Reference to metrics object owned by the PageAllocator.
    */
-  PageAllocatorMetrics& metrics;
+  PageAllocatorMetrics& metrics_;
 
-  const PageIdFactory page_ids;
-
-  /** \brief When true, update is being passed recovered slot data; otherwise, update is receiving
-   * data we just appended.  When in recovery mode, update should return error status codes for
-   * invalid data; when not, it should panic.
+  /** \brief Passed in at construction time; captures the page device id and page count.
    */
-  bool in_recovery_mode;
+  const PageIdFactory page_ids_;
 
+  /** \brief Tracks the recovery state of all attached users.
+   */
   std::unordered_map<boost::uuids::uuid, UserRecoveryState, boost::hash<boost::uuids::uuid>>
-      pending_recovery;
+      pending_recovery_;
 
-  std::unordered_map<boost::uuids::uuid, AttachState, boost::hash<boost::uuids::uuid>> attach_state;
+  /** \brief The current set of attached users.
+   */
+  std::unordered_map<boost::uuids::uuid, AttachState, boost::hash<boost::uuids::uuid>>
+      attach_state_;
 
-  std::vector<PageState> page_state;
+  /** \brief The generation and ref count for each physical page.
+   */
+  std::vector<PageState> page_state_;
 
-  SlotLockManager* trim_control;
+  /** \brief Used to lock slot ranges when recovering user txns.
+   */
+  SlotLockManager* trim_control_;
 };
 
 std::ostream& operator<<(std::ostream& out, const PageAllocatorState::CheckpointInfo& t);
@@ -308,6 +352,8 @@ std::ostream& operator<<(std::ostream& out, const PageAllocatorState::Checkpoint
 class PageAllocator
 {
  public:
+  friend class PageAllocatorAttachment;
+
   static constexpr u64 kCheckpointTargetSizeLog2 = 12;
   static constexpr u64 kCheckpointTargetSize = 4 * kKiB;
 
@@ -319,7 +365,7 @@ class PageAllocator
 
   static StatusOr<std::unique_ptr<PageAllocator>> recover(
       const PageAllocatorRuntimeOptions& options, const PageIdFactory& page_ids,
-      MaxAttachments max_attachments, LogDeviceFactory& log_device_factory);
+      MaxAttachments max_attachments, LogDeviceFactory& log_device_factory) noexcept;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -377,14 +423,14 @@ class PageAllocator
 
   /** \brief Called by attached users to indicate they have successfully recovered.
    */
-  Status notify_user_recovered(const boost::uuids::uuid& user_id);
+  Status notify_user_recovered(const boost::uuids::uuid& user_id) noexcept;
 
   /** \brief Blocks the caller until all users have completed recovery of any pending txns.
    *
    * Note: all attached users *must* at least ask for pending txns and notify the allocator that
    * they are done in order for this process to complete.
    */
-  Status require_users_recovered(batt::WaitForResource wait_for_resource);
+  Status require_users_recovered(batt::WaitForResource wait_for_resource) noexcept;
 
   //----- --- -- -  -  -   -
 
@@ -394,13 +440,13 @@ class PageAllocator
    *
    * \return the slot upper bound of the new attachment if successful, otherwise error status
    */
-  StatusOr<slot_offset_type> attach_user(const boost::uuids::uuid& user_id);
+  StatusOr<slot_offset_type> attach_user(const boost::uuids::uuid& user_id) noexcept;
 
   /** \brief Removes `user_id` from the attached user list.
    *
    * \return the slot upper bound of the detachment if successful, otherwise error status
    */
-  StatusOr<slot_offset_type> detach_user(const boost::uuids::uuid& user_id);
+  StatusOr<slot_offset_type> detach_user(const boost::uuids::uuid& user_id) noexcept;
 
   /** \brief Returns true iff the passed `user_id` is attached to this allocator.
    */
@@ -410,11 +456,14 @@ class PageAllocator
 
   /** \brief Removes a page from the free pool, leaving its refcount as zero.
    *
+   * The passed `user_id` must be attached (via this->attach_user).
+   *
    * The returned PageId will have the lowest-valued generation number that hasn't yet been used
    * for that physical page.
    */
-  StatusOr<PageId> allocate_page(batt::WaitForResource wait_for_resource,
-                                 const batt::CancelToken& cancel_token = batt::CancelToken::none());
+  StatusOr<PageId> allocate_page(
+      const boost::uuids::uuid& user_id, batt::WaitForResource wait_for_resource,
+      const batt::CancelToken& cancel_token = batt::CancelToken::none()) noexcept;
 
   /** \brief Return the given page to the free pool without updating its refcount.
    */
@@ -435,22 +484,22 @@ class PageAllocator
       const boost::uuids::uuid& user_id,    //
       slot_offset_type user_slot,           //
       PageRefCountSeq&& ref_count_updates,  //
-      GarbageCollectFn&& garbage_collect_fn = GarbageCollectFn{});
+      GarbageCollectFn&& garbage_collect_fn = GarbageCollectFn{}) noexcept;
 
   /** \brief Block until flushed (durable) updates have caught up with the specified slot number.
    */
-  Status sync(slot_offset_type min_slot);
+  Status sync(slot_offset_type min_slot) noexcept;
 
   //----- --- -- -  -  -   -
 
   /** \brief Returns the current ref count information for the given page.
    */
-  StatusOr<i32> get_ref_count(PageId page_id);
+  StatusOr<i32> get_ref_count(PageId page_id) noexcept;
 
   /** \brief Returns the current PageId (which includes the current generation number and device id)
    * and ref count for the given physical page.
    */
-  StatusOr<PageRefCount> get_ref_count(PhysicalPageId physical_page);
+  StatusOr<PageRefCount> get_ref_count(PhysicalPageId physical_page) noexcept;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
  private:
@@ -468,12 +517,6 @@ class PageAllocator
    * \return The recovered slot range.
    */
   StatusOr<SlotRange> recover_impl();
-
-  /** \brief Populates the free page pool; this must only be done once all users have notified the
-   * allocator that their recovery is complete, since their recovery process might involve updating
-   * ref counts (0 -> 2) for new pages that they have written.
-   */
-  void init_free_page_pool(batt::ScopedLock<PageAllocatorState>& locked_state) noexcept;
 
   /** \brief Starts the compaction task; must be called after recovery.
    */
@@ -517,7 +560,7 @@ class PageAllocator
 
   // The maximum number of configured client attachments.
   //
-  const u64 max_attachments_;
+  const MaxAttachments max_attachments_;
 
   // Set by this->pre_halt(); controls verbosity of errors that might be logged during halt.
   //
@@ -593,7 +636,7 @@ inline StatusOr<SlotReadLock> PageAllocator::update_page_ref_counts(
     const boost::uuids::uuid& user_id,    //
     slot_offset_type user_slot,           //
     PageRefCountSeq&& ref_count_updates,  //
-    GarbageCollectFn&& garbage_collect_fn)
+    GarbageCollectFn&& garbage_collect_fn) noexcept
 {
   //----- --- -- -  -  -   -
   // Summary:
@@ -688,7 +731,8 @@ inline StatusOr<SlotReadLock> PageAllocator::update_page_ref_counts(
 
     // 3.5. Update the state before releasing mutex.
     //
-    BATT_CHECK_OK(locked_state->update(packed_slot->slot, *packed_slot->payload))
+    BATT_CHECK_OK(
+        locked_state->update(packed_slot->slot, *packed_slot->payload, /*in_recovery_mode=*/false))
         << "This should never fail!";
   }
   //
@@ -745,7 +789,7 @@ inline StatusOr<slot_offset_type> PageAllocator::process_attach_event(const Atta
 
     // Check to make sure we have a free attachment available.
     //
-    if (desired_state && (locked_state->attach_state.size() + 1 > this->max_attachments_)) {
+    if (desired_state && (locked_state->attached_user_count() + 1 > this->max_attachments_)) {
       return ::llfs::make_status(llfs::StatusCode::kOutOfAttachments);
     }
 
@@ -753,7 +797,8 @@ inline StatusOr<slot_offset_type> PageAllocator::process_attach_event(const Atta
         this->slot_writer_.typed_append(slot_grant, event);
 
     BATT_REQUIRE_OK(packed_slot);
-    BATT_REQUIRE_OK(locked_state->update(packed_slot->slot, *packed_slot->payload));
+    BATT_REQUIRE_OK(
+        locked_state->update(packed_slot->slot, *packed_slot->payload, /*in_recovery_mode=*/false));
 
     slot_upper_bound = packed_slot->slot.offset.upper_bound;
   }

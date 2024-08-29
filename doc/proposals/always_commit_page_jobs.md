@@ -119,19 +119,185 @@ This document is structured around the lifecycle phases of a page in LLFS:
 - Live (ref count >= 2, reachable from >= 1 Volume logs)
 - Dead (ref count == 1, owned by PageRecycler)
 
-Each state transition (Free -> Allocated, Allocated -> Free, Allocated -> Live, Live -> Dead, Dead -> Free) has unique issues to address in order to meet the requirements as stated above.  These issues will be discussed in the context of the pertinent design elements for each transition in the sections below.
+Each state transition (Free-to-Allocated, Allocated-to-Free, Allocated-to-Live, Live-to-Dead, Dead-to-Free) has unique issues to address in order to meet the requirements as stated above.  These issues will be discussed in the context of the pertinent design elements for each transition in the sections below.
 
-### Initial Page Allocator State
+Each state transition is performed by a specific client/job type, as follows:
+
+- Free-to-Allocated, Allocated-to-Live: **New Page Job**
+- Live-to-Dead: **Trim Page Job**
+- Dead-to-Free: **Recycle Page Job**
+
+Each job type has a specific protocol, which will be described in the state transition section for that job type.
+
+### Page Job Types
+
+#### New Page Job
+
+- Introduces zero or more newly written pages
+- `llfs::PageDevice::write` is called to write page data
+- Introduces 1 or more page references (root references)
+- All Page Ref Count deltas are positive
+- All new pages have a delta of at least +2
+- Appended to the root log of a Volume
+
+#### Trim Page Job
+
+- Removes one or more root (log) references
+- All Page Ref Count deltas are negative
+- May cause reference count for a page to go to 1, but never to 0
+- Executed by the `llfs::VolumeTrimmer`  associated with an `llfs::Volume`, prior to trimming the root log
+
+#### Recycle Page Job
+
+- Removes the last reference to one or more pages (these are the recycled pages)
+- Decrements the reference counts of all pages referenced by the recycled pages
+- Executed by the `llfs::PageRecycler`
+- `llfs::PageDevice::drop` is called to remove the data associated with the recycled pages (this may result in, for example, an NVMe trim operation, or the removal of a file representing the page in a host filesystem)
+
+### Initial PageAllocator State
+
+When a `PageAllocator` is created, several parameters are configured; these remain constant during the lifetime of the `PageAllocator`:
+
+- ID of the associated `PageDevice`, both `UUID` and device id (`u16`), which is scoped to a particular `StorageContext` and `PageCache`, though a given `PageDevice` must have the same device id in all contexts in which it appears
+- Page Count (reflected from the `PageDevice` configuration)
+- Max Attachments: the maximum number of client `UUID`s that can be attached to (i.e., registered with) the allocator
+- UUID of the `LogDevice` that will store the `PageAllocator` state.  This must be at least some minimum size, determined by the Page Count and Max Attachments parameters.
+
+The durable state of a `PageAllocator` is comprised of the following:
+
+1. For each physical page:
+   1. The current generation number (`u64`)
+   2. The current reference count (`i32`)
+   3. (If ref count &gt; 0) Whether the page has outgoing references to other pages (`bool`)
+2. The set of attached client `UUID`s; this set's size must not exceed Max Attachments
+3. The set of unresolved client transactions; each transaction is comprised of:
+   1. The `UUID` of an attached client (user)
+   2. A client-defined `user_slot` (`u64`), which uniquely identifies that transaction in the context of the user
+   3. A list of updates to page reference counts
+
+Initially, the `PageAllocator` log starts out empty, and the state is assumed to be:
+
+- All pages' generation and ref count are zero
+- The set of attached clients is empty
+- The set of unresolved transactions is empty
+
+In the initial state, all pages are considered Free.
+
+### Free-to-Allocated
+
+A given `PageId` leaves the Free state and enters state Allocated via a call to `PageAllocator::allocate_page`:
+
+```c++
+batt::CancelToken cancel_token;
+
+batt::StatusOr<llfs::PageId> new_page_id = 
+  page_allocator->allocate_page(batt::WaitForResource::kTrue, cancel_token);
+
+BATT_REQUIRE_OK(new_page_id);
+```
+
+On success,`allocate_page` returns the `PageId` of a page whose reference count is zero and which has never been written in the current generation (encoded in the middle bits of the `PageId` itself).  Once a given `PageId` has been returned by `allocate_page`, that `PageId` will **not** be returned again (unless the allocation is "cancelled" via `PageAllocator::deallocate_page`; see Allocated-to-Free below).  Thus `allocate_page` grants unique ownership of the page to the caller.
+
+The `batt::WaitForResource` arg specifies what `allocate_page` should do if there are no free pages available; if true, then the caller is blocked until the request is explicitly cancelled or a page becomes available (see Dead-to-Free).  If false, `allocate_page` immediately returns `batt::StatusCode::kResourceExhausted` if there are no free pages available.
+
+The `batt::CancelToken` arg is optional; if present, it allows the caller to cancel a blocked call to `allocate_page` from another task before it completes.  It doesn't make sense to specify a cancel token _and_ `batt::WaitForResource::kFalse`, since there is never a blocking call to interrupt in this case.
+
+The fact that a page is in the Allocated state is something which must be durably recorded _outside_ the `PageAllocator` log.  The standard way to do this is by writing a `PackedPageJob` slot to a `Volume` log, as described in Allocated-to-Live.  When the state of a `PageAllocator` is recovered from its log, all slots are scanned.  From this scan, we get a list of attached users (clients) and pending (unresolved) transactions.  It is crucially important that each page's state be accurately recovered before the PageAllocator enters "normal operation."  For example, if the actual state of a page is Allocated, but we recover it as Free, then the page may be re-allocated to some different client, potentially violating Requirement (R3) "Consistent Data/PageId Mapping (or Unique-Allocation."  Thus, after `PageAllocator::recover` is called, each attached or potentially attached client must call `PageAllocator::get_pending_recovery(user_id)` to begin _external recovery_, which is terminated when the client calls `PageAllocator::notify_user_recovered`.  When the PageAllocator is in external recovery, `allocate_page` operations are temporarily suspended so that unique page ownership can be maintained.  See the page job protocol sections of each of the page state transition descriptions below for details on how each client/job type performs recovery and why each protocol maintains crash consistency.
+
+### Allocated-to-Free
+
+If a client allocates a page and then decides it doesn't need the allocated page, it can revert the page state back to free by calling `PageAllocator::deallocate_page`.  Once a client does this, it no longer claims exclusive access to that page, and must not attempt to write or reference it, etc.
+
+### Allocated-to-Live
+
+A page's state changes from Allocated to Live via `PageAllocator::update_page_ref_counts`:
+
+```c++
+std::vector<llfs::PageRefCount> updates;
+updates.emplace_back(llfs::PageRefCount{.page_id = *new_page_id, .ref_count = 2,});
+
+batt::StatusOr<llfs::SlotReadLock> txn_lock =
+  page_allocator->update_page_ref_counts(user_id, user_slot, batt::as_seq(updates));
+
+BATT_REQUIRE_OK(txn_lock);
+```
+
+When calling `update_page_ref_counts`, the following requirements must be met:
+
+1. `user_id` must be the `UUID` (`boost::uuids::uuid`) of an attached client
+2. `user_slot` must be an integer uniquely associated (by the client) to the specific set of updates being passed
+3. Any `PageId`s in the updates sequence must refer to pages for which one of the following is true:
+   1. The page is in the Live state, and the caller owns at least one reference to the page
+   2. The page is in the Allocated state, the caller is the current owner of the page, and the ref count delta is at least +2
+
+The `.ref_count` (`i32`) values in the updates sequence specify relative count deltas; i.e. the change in reference count relative to the current ref count of a page.  At no point may a page's ref count go below 0.  When a page's ref count goes from 0 to some positive value, it must go to at least 2 (1 future reference for the garbage collection pipeline, >= 1 reference for the client).
+
+On success, `update_page_ref_counts` returns an `llfs::SlotReadLock` object that prevents the `PageAllocator` from trimming the portion of its log that contains a record of the update (a slot record of type `llfs::PackedPageAllocatorTxn`).
+
+In LLFS, all pages are accessed either directly from the log of an `llfs::Volume` by reading a `PageId` from some slot record, or indirectly from another page.  The application must guarantee that reference cycles are never introduced when writing new pages; i.e., the set of new pages in a given page job must not contain reference cycles.  
+
+#### New Page Job Protocol
+
+The protocol for writing a new page reference to a Volume is:
+
+1. If the Volume is not currently attached, call `PageAllocator::attach_user` with the Volume's UUID
+2. Call `PageAllocator::allocate_page` one or more times to allocate new pages
+3. Call `PageDevice::prepare(PageId)` for each allocated page, to obtain a buffer into which to write that page's data
+4. Initialize the buffer(s) with page data
+5. Call `PageDevice::write` to write the initialized data buffer to the storage device.  Write the pages in parallel, and wait for all to complete.
+6. Append a `PackedPageJob` slot to the Volume's root log, containing the list of all new pages, root references, and any (opaque) user data associated with the job
+7. Call `LogDevice::sync` on the Volume's root log to flush the `PackedPageJob` slot
+8. Call `PageAllocator::update_page_ref_counts` with the updated reference counts for the new pages and any pages they reference; retain the returned `SlotReadLock` until released below (_Note: this step may entail calling `update_page_ref_counts` for many `PageAllocator` instances concurrently_); `user_slot` should be the slot offset of the `PackedPageJob` slot appended in (6)
+9. Wait for all `PageAllocator`s involved in (8) to flush the page ref count transaction slots by calling `PageAllocator::sync`
+10. Append a `PackedPageRefCountsCommitted` slot to the Volume log, referencing the slot offset from (6); **wait for this slot to be flushed**
+11. Release the `SlotReadLock` from (8)
+
+#### Crash Consistency of New Page Jobs
+
+This section contains a proof of crash consistency for the protocol described above.  
+
+Most of the heavy lifting here is done by the crash-consistency of `LogDevice::commit`.  Specifically, all implementations of `LogDevice` are required to guarantee the following:
+
+- When a `LogDevice` is recovered (after crash), the recovered slot offset upper bound of the log must be some offset resulting from a prior call to `LogDevice::commit`
+- All data up to the recovered slot offset upper bound of the log must be valid; i.e., it must be the same as the contents of the in-memory log ring buffer when `LogDevice::commit` was called prior to the crash
+
+Given these properties, it is trivial to implement atomic log slot appends which are crash consistent.  Thus each page state transition involved in a New Page Job (Free-to-Allocated and Allocated-to-Live) is made durable via an atomic log append:
+
+- Free-to-Allocated is made durable via the `PackedPageJob` record appended to the Volume log
+- Allocated-to-Live is made durable via the `PackedPageAllocatorTxn` record appended to the PageAllocator log
+
+The correct client recovery steps depend on which durable state the new page(s) are in when the crash occurs:
+
+- Free: recovery should take _no_ steps, the page(s) should be added to the free pool, and made available for allocation by other clients
+- Allocated: recovery should recompute the Page Ref Count deltas for the job and apply them to the proper `PageAllocator`s to complete the job
+- Live: recovery should mark the job as completed so that the Txn slots can be removed from the `PageAllocator` logs
+
+The recovery protocol is as follows:
+
+1. When recovering a `Volume` root log, record all `PackedPageJob` slots that have no corresponding `PackedPageRefCountsCommitted` slot.  This forms the set of _pending New Page Jobs_.
+2. For each pending New Page Job, load the page data for all new pages listed in the slot.  Since we read the `PackedPageJob` slot, we know that the crash occurred after (6), so it must also have occurred after (5), which writes all page data.
+3. Reconstruct a list of `PageDevice`/`PageAllocator`s involved in the job from the new pages by (re-)calculating the Page Ref Count deltas using trace refs for each page.
+4. Call `PageAllocator::get_pending_recovery` for each device.
+5. Call `PageAllocator::update_page_ref_counts` for each device that did not return a txn lock for the page job slot
+6. Call `PageAllocator::sync` to make sure the new updates are durable
+7. Write a `PackedPageRefCountsCommitted` slot to the Volume log and wait for it to sync
+8. Release any txn `SlotReadLock`s obtained in recovery step 4 (`get_pending_recovery`)
+9. Call `PageAllocator::notify_user_recovered` once all New Page Jobs have been recovered
+
+The recovery protocol shows that if we get as far as flushing a `PackedPageJob` before the crash, then enough data has been saved to always commit the job.  If we did not get this far, then since there is no record of the job ever having occurred, there is no root reference to any new pages in any log(s), so it doesn't matter that the data was written; it will simply be overwritten when the page is next allocated.  _Note: an important consequence of this design is that the `PackedPageJob` slot that introduces a new page **must** be appended strictly before any other slot that introduces another reference to that page, whether directly (from a log slot) or indirectly (from another new page)._
+
+### Live-to-Dead
+
+During the Live phase of a page's lifecycle, the reference count may go up and down.  However, once the reference count decreases to 1, it is considered Dead.  A Dead page may not become live again; once its reference count becomes 1, ownership of that page is transferred to a `PageRecycler`, which takes care of driving the transition from Dead-to-Free.
+
+There are two ways a page can become dead:
+
+1. The last reference to the page is in a Volume root log that is trimmed, removing the reference
+2. The last reference to the page is in a dead page, which becomes free by being recycled
 
 
 
-### Free -> Allocated
-
-### Allocated -> Live
-
-### Live -> Dead
-
-### Dead -> Free
+### Dead-to-Free
 
 
 

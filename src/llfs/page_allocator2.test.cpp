@@ -381,8 +381,8 @@ class PageAllocator2SimTest : public ::testing::Test
      * PageAllocator.
      */
     template <typename VecT>
-    void add_new_pages(usize min_pages, usize max_pages, i32 min_ref_count, i32 max_ref_count,
-                       VecT* ref_count_updates)
+    void add_new_pages(const boost::uuids::uuid& user_id, usize min_pages, usize max_pages,
+                       i32 min_ref_count, i32 max_ref_count, VecT* ref_count_updates)
     {
       BATT_CHECK_NOT_NULLPTR(this->page_allocator);
 
@@ -390,7 +390,7 @@ class PageAllocator2SimTest : public ::testing::Test
 
       for (usize i = 0; i < n_pages; ++i) {
         StatusOr<llfs::PageId> page_id =
-            this->page_allocator->allocate_page(batt::WaitForResource::kFalse);
+            this->page_allocator->allocate_page(user_id, batt::WaitForResource::kFalse);
 
         // If we run out of free pages, but have met the minimum number, succeed.
         //
@@ -787,7 +787,7 @@ void PageAllocator2SimTest::SimulatedUser::new_pages(Scenario& scenario)
 
   for (usize i = 0; i < n_pages; ++i) {
     StatusOr<llfs::PageId> new_page_id =
-        scenario.page_allocator->allocate_page(batt::WaitForResource::kFalse);
+        scenario.page_allocator->allocate_page(this->user_id, batt::WaitForResource::kFalse);
 
     if (!new_page_id.ok()) {
       if (new_page_id.status() != batt::StatusCode::kResourceExhausted) {
@@ -854,7 +854,7 @@ TEST_F(PageAllocator2SimTest, Recover)
 {
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(1000)
-      .n_updates(4)
+      .n_updates(0)
       .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         ASSERT_NO_FATAL_FAILURE(scenario.recover());
 
@@ -928,11 +928,29 @@ TEST_F(PageAllocator2SimTest, Recover)
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
+TEST_F(PageAllocator2SimTest, AllocatePageNoAttach)
+{
+  llfs::testing::ScenarioRunner{}  //
+      .n_seeds(100)
+      .n_updates(0)
+      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
+        ASSERT_NO_FATAL_FAILURE(scenario.recover());
+
+        StatusOr<llfs::PageId> result =
+            scenario.page_allocator->allocate_page(scenario.user_id, batt::WaitForResource::kFalse);
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(result.status(), llfs::make_status(llfs::StatusCode::kPageAllocatorNotAttached));
+      });
+}
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
 TEST_F(PageAllocator2SimTest, UpdateRefCountsNoAttach)
 {
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(1000)
-      .n_updates(4)
+      .n_updates(0)
       .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         ASSERT_NO_FATAL_FAILURE(scenario.recover());
 
@@ -953,13 +971,14 @@ TEST_F(PageAllocator2SimTest, NewPageRefCountTooSmall)
 {
   llfs::testing::ScenarioRunner{}  //
       .n_seeds(100)
-      .n_updates(4)
+      .n_updates(0)
       .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
         ASSERT_NO_FATAL_FAILURE(scenario.recover());
         ASSERT_NO_FATAL_FAILURE(scenario.attach_user(scenario.user_id));
 
         batt::SmallVec<llfs::PageRefCount, kTestPageCount> ref_count_updates;
-        ASSERT_NO_FATAL_FAILURE(scenario.add_new_pages(1, 3, 1, 1, &ref_count_updates));
+        ASSERT_NO_FATAL_FAILURE(
+            scenario.add_new_pages(scenario.user_id, 1, 3, 1, 1, &ref_count_updates));
 
         StatusOr<llfs::SlotReadLock> txn_lock = scenario.page_allocator->update_page_ref_counts(
             scenario.user_id, /*user_slot=*/0, llfs::as_seq(ref_count_updates));
@@ -994,7 +1013,8 @@ TEST_F(PageAllocator2SimTest, AllocatePages)
           // PageIds.
           //
           batt::SmallVec<llfs::PageRefCount, kTestPageCount> ref_count_updates;
-          ASSERT_NO_FATAL_FAILURE(scenario.add_new_pages(1, 3, 2, 5, &ref_count_updates));
+          ASSERT_NO_FATAL_FAILURE(
+              scenario.add_new_pages(scenario.user_id, 1, 3, 2, 5, &ref_count_updates));
 
           // Apply updates.
           //
@@ -1070,8 +1090,9 @@ TEST_F(PageAllocator2SimTest, CheckpointAndTrim)
           // Allocate all the pages.
           //
           batt::SmallVec<llfs::PageRefCount, kTestPageCount> ref_count_updates;
-          ASSERT_NO_FATAL_FAILURE(scenario.add_new_pages(scenario.page_count, scenario.page_count,
-                                                         2, 2, &ref_count_updates));
+          ASSERT_NO_FATAL_FAILURE(scenario.add_new_pages(scenario.user_id, scenario.page_count,
+                                                         scenario.page_count, 2, 2,
+                                                         &ref_count_updates));
 
           usize past_count = 0;
 
@@ -1192,11 +1213,11 @@ TEST_F(PageAllocator2SimTest, CheckpointAndTrim)
 //
 TEST_F(PageAllocator2SimTest, MultiUserUpdates)
 {
+  std::atomic<usize> n{0}, steps{0};
+
   llfs::testing::ScenarioRunner{}  //
-      .n_seeds(1)
-      .n_updates(1)
-      .n_threads(1)
-      .run(batt::StaticType<Scenario>{}, [](Scenario& scenario) {
+      .n_seeds(1000 * 1000)
+      .run(batt::StaticType<Scenario>{}, [&](Scenario& scenario) {
         (void)scenario;
 
         // Plan:
@@ -1210,6 +1231,8 @@ TEST_F(PageAllocator2SimTest, MultiUserUpdates)
         //       - process a message
         //
 
+        scenario.page_count = llfs::PageCount{8};
+
         ASSERT_NO_FATAL_FAILURE(scenario.recover());
 
         for (SimulatedUser& user : scenario.users) {
@@ -1220,12 +1243,11 @@ TEST_F(PageAllocator2SimTest, MultiUserUpdates)
           user.task = std::make_shared<batt::Task>(
               scenario.sim.schedule_task(),
 
-              // Task main:
-              //
+              /*task_main_fn=*/
               [&scenario, p_user = &user] {
                 ASSERT_NO_FATAL_FAILURE(p_user->recover(scenario));
 
-                LLFS_LOG_INFO() << BATT_INSPECT(p_user->done) << BATT_INSPECT(p_user->status);
+                LLFS_VLOG(1) << BATT_INSPECT(p_user->done) << BATT_INSPECT(p_user->status);
 
                 while (!p_user->done && p_user->ok()) {
                   batt::Task::yield();
@@ -1259,7 +1281,12 @@ TEST_F(PageAllocator2SimTest, MultiUserUpdates)
             scenario.verify_slots(all_slots.data(), all_slots.data() + all_slots.size());
 
         BATT_CHECK(verified);
+
+        n.fetch_add(1);
+        steps.fetch_add(scenario.sim.current_step());
       });
+
+  LLFS_LOG_INFO() << "Average steps: " << (double)steps.load() / (double)n.load();
 }
 
 // Test Plan:

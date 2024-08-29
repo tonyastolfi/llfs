@@ -83,6 +83,10 @@ enum struct StatusCode {
   kLogControlBlockBadMagic = 65,
   kLogDeviceV1Deprecated = 66,
   kPageAllocatorInitRefCountTooSmall = 67,
+  kPageAllocatorTooManyRecoveredTxnUsers = 68,
+  kPageAllocatorTooManyRecoveredAttachments = 69,
+  kPageAllocatorRecoveredTxnUserNotAttached = 70,
+  kPageAllocatorRecoveredPageOutOfRange = 71,
 };
 
 bool initialize_status_codes();

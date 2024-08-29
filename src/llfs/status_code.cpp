@@ -142,6 +142,16 @@ bool initialize_status_codes()
       CODE_WITH_MSG_(
           StatusCode::kPageAllocatorInitRefCountTooSmall,
           "The initial reference count for new page is too small (must be at least 2)"),  // 67,
+      CODE_WITH_MSG_(StatusCode::kPageAllocatorTooManyRecoveredTxnUsers,
+                     "The number of unique user_ids in recovered txns is greater than the max "
+                     "attachments"),  // 68,
+      CODE_WITH_MSG_(StatusCode::kPageAllocatorTooManyRecoveredAttachments,
+                     "The number of recovered attachments is over the max limit"),  // 69,
+      CODE_WITH_MSG_(StatusCode::kPageAllocatorRecoveredTxnUserNotAttached,
+                     "Recovered txn with user_id which is not attached"),  // 70,
+      CODE_WITH_MSG_(StatusCode::kPageAllocatorRecoveredPageOutOfRange,
+                     "Recovered PageId is out-of-range"),  // 71,
+
   });
   return initialized;
 }
