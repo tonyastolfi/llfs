@@ -1,0 +1,15 @@
+%%{init: {'theme':'default'}}%%
+
+stateDiagram-v2
+
+Free: Free (refs=0, available)
+Allocated: Allocated (refs=0, unavailable)
+Live: Live (refs>1, reachable)
+Dead: Dead (refs=1, owned by PageRecycler)
+
+Free --> Allocated: allocate_page
+Allocated --> Free: deallocate_page
+Allocated --> Live: update_page_ref_counts (New Page Job)
+Live --> Dead: update_page_ref_counts (Trim/Recycle Page Job)
+Dead --> Free: update_page_ref_counts (Recycle Page Job)
+

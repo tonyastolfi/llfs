@@ -1,0 +1,83 @@
+%%{init: {'theme':'default'}}%%
+
+sequenceDiagram
+
+participant Client as Client
+participant Volume as Volume Root Log
+participant Allocator1 as PageAllocator 1
+participant Device1 as PageDevice 1
+participant Allocator2 as PageAllocator 2
+participant Device2 as PageDevice 2
+
+Client->>Allocator1: attach_user
+activate Allocator1
+Client->>Allocator2: attach_user
+activate Allocator2
+Allocator1-->>Client: (durable)
+deactivate Allocator1
+Allocator2-->>Client: (durable)
+deactivate Allocator2
+
+Client->>Allocator1: allocate_page
+activate Allocator1
+Allocator1->>Client: PageId
+deactivate Allocator1
+Client->>Device1: prepare
+activate Device1
+Device1->>Client: PageBuffer
+deactivate Device1
+
+Client->>Allocator2: allocate_page
+activate Allocator2
+Allocator2->>Client: PageId
+deactivate Allocator2
+Client->>Device2: prepare
+activate Device2
+Device2->>Client: PageBuffer
+deactivate Device2
+
+activate Client
+Client ->> Client: fill PageBuffers
+deactivate Client
+
+Client ->> Device1: write(PageBuffer)
+activate Device1
+Client ->> Device2: write(PageBuffer)
+activate Device2
+Device1 ->> Client: (durable)
+deactivate Device1
+Device2 ->> Client: (durable)
+deactivate Device2
+
+Client ->> Volume: PackedPageJob
+activate Volume
+Volume ->> Client: (durable)
+deactivate Volume
+
+Client ->> Allocator1: update_page_ref_counts
+activate Allocator1
+Client ->> Allocator2: update_page_ref_counts
+activate Allocator2
+
+create participant SlotReadLock1 as SlotReadLock 1
+Allocator1 ->> SlotReadLock1: create
+
+create participant SlotReadLock2 as SlotReadLock 2
+Allocator2 ->> SlotReadLock2: create
+
+Allocator1 ->> Client: (durable)
+deactivate Allocator1
+Allocator2 ->> Client: (durable)
+deactivate Allocator2
+
+Client ->> Volume: PackedPageRefCountsCommitted
+activate Volume
+Volume ->> Client: (durable)
+deactivate Volume
+
+destroy SlotReadLock1
+Client -x SlotReadLock1: release
+
+destroy SlotReadLock2
+Client -x SlotReadLock2: release
+

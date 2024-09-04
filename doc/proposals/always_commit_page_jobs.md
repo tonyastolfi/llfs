@@ -62,10 +62,10 @@ The definitions of the new `Volume` event slot records are as follows:
 
 ```c++
 struct PackedPageJob {
-  PackedPointer<PackedArray<PackedPageId>> root_page_ids;
-  PackedPointer<PackedArray<PackedPageId>> new_page_ids;
-  PackedPointer<PackedArray<PackedPageId>> deleted_page_ids;
-  PackableRef user_data;
+  PackedPointer<PackedArray<PackedPageId>> new_pages;
+  PackedPointer<PackedArray<PackedPageId>> root_refs;
+  //
+  // (followed by raw user data...)
 };
 
 struct PackedPageRefCountsCommitted {
@@ -105,26 +105,16 @@ A correct design must meet the following requirements:
 
 ## Detailed Design
 
-Clients/Users of PageAllocator:
-
-- PageCacheJob
-- Volume
-- VolumeTrimmer
-- PageRecycler
-
 This document is structured around the lifecycle phases of a page in LLFS:
 
-- Free (ref count = 0, in free pool) 
-- Allocated (ref count = 0, not in free pool)
-- Live (ref count >= 2, reachable from >= 1 Volume logs)
-- Dead (ref count == 1, owned by PageRecycler)
+![Page Lifecycle States](./page_lifecycle.svg)
 
 Each state transition (Free-to-Allocated, Allocated-to-Free, Allocated-to-Live, Live-to-Dead, Dead-to-Free) has unique issues to address in order to meet the requirements as stated above.  These issues will be discussed in the context of the pertinent design elements for each transition in the sections below.
 
 Each state transition is performed by a specific client/job type, as follows:
 
 - Free-to-Allocated, Allocated-to-Live: **New Page Job**
-- Live-to-Dead: **Trim Page Job**
+- Live-to-Dead: **Trim Page Job** or **Recycle Page Job** (depending on where the last ref to the page lives)
 - Dead-to-Free: **Recycle Page Job**
 
 Each job type has a specific protocol, which will be described in the state transition section for that job type.
@@ -252,6 +242,11 @@ The protocol for writing a new page reference to a Volume is:
 10. Append a `PackedPageRefCountsCommitted` slot to the Volume log, referencing the slot offset from (6); **wait for this slot to be flushed**
 11. Release the `SlotReadLock` from (8)
 
+
+![New Page Job Protocol](./new_page_job_seq.svg)
+
+
+
 #### Crash Consistency of New Page Jobs
 
 This section contains a proof of crash consistency for the protocol described above.  
@@ -295,13 +290,28 @@ There are two ways a page can become dead:
 1. The last reference to the page is in a Volume root log that is trimmed, removing the reference
 2. The last reference to the page is in a dead page, which becomes Free by being recycled
 
+The first of these happens via a Trim Page Job, and the second via a Recycle Page Job.  Since Dead-to-Free also happens during a Recycle Page Job, we will discuss Trim Page Jobs here, and cover Recycle Page Jobs in the Dead-to-Free section.
 
+#### Trim Page Job Protocol
+
+The protocol for trimming a portion of a Volume log that contains `PackedPageJob` slots is as follows:
+
+1. Create a list of Page Ref Count deltas from the root refs in the `PackedPageJob` slots; each PageId should have a -1 delta for each time it occurs in any of the trimmed slots (as a root ref)
+2. Attach the VolumeTrimmer to any PageAllocators for devices found in step (1), if not already attached; _it is important that the VolumeTrimmer be attached using a different UUID (user_id) than the Volume!_
+3. Call `PageAllocator::update_page_ref_counts` using the ref count deltas from (1) and the new trim pos as the user slot; **wait for all allocators to flush updates (sync)**
+4. Trim the Volume root log
+5. If there are dead pages reported by `update_page_ref_counts`, then call `PageRecycler::recycle_pages` to transfer ownership to the `PageRecycler`.  Since `recycle_pages` is idempotent, this is safe to do even if the page is already known to the `PageRecycler`. **wait for PageRecycler to flush**
+6. Release the `SlotReadLock`s returned by (3) once we know the trim and any dead page ownership transfers are durable 
+
+Only a single trim (instance of this protocol) is executed at a time for a given Volume.
+
+#### Crash Consistency of Trim Page Jobs
+
+During Volume recovery, we build up a list of PageDevices for all the page references in the root log and attach to each of these, calling `PageAllocator::get_pending_recovery` afterwards.  This will reveal whether there was a pending trim operation in progress prior to the recovery.  If there is no pending txn returned by `get_pending_recovery`, then we didn't get past step (2), so we can simply start over afresh.  Otherwise, we determine whether (3) was completed by seeing if there are any missing PageDevices; if so, call `update_page_ref_counts` just for those devices and continue with steps (4), (5), and (6).
 
 ### Dead-to-Free
 
-
-
-
+_TODO [tastolfi 2024-09-04]_
 
 ## Assumptions
 
