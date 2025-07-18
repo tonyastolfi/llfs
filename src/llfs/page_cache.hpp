@@ -122,6 +122,8 @@ class PageCache : public PageLoader
     PageCache& page_cache_;
   };
 
+  using ExternalAllocation = PageCacheSlot::Pool::ExternalAllocation;
+
   //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 
   static std::atomic<bool>& job_debug_on()
@@ -179,6 +181,11 @@ class PageCache : public PageLoader
                                                   const batt::CancelToken& cancel_token = None);
 
   StatusOr<PinnedPage> allocate_filter_page_for(PageId page_id, LruPriority lru_priority);
+
+  ExternalAllocation allocate_external(usize byte_size)
+  {
+    return this->cache_slot_pool_->allocate_external(byte_sie);
+  }
 
   void async_write_filter_page(const PinnedPage& new_filter_page,
                                PageDevice::WriteHandler&& handler);
@@ -248,6 +255,11 @@ class PageCache : public PageLoader
   PageCacheSlot::Pool& slot_pool()
   {
     return *this->cache_slot_pool_;
+  }
+
+  const boost::intrusive_ptr<PageCacheSlot::Pool>& shared_slot_pool()
+  {
+    return this->cache_slot_pool_;
   }
 
   const PageCacheSlot::Pool::Metrics& slot_pool_metrics() const

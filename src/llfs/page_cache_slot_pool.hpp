@@ -114,6 +114,7 @@ class PageCacheSlot::Pool : public boost::intrusive_ref_counter<Pool>
         : pool_{std::move(that.pool_)}
         , size_{that.size_}
     {
+      that.pool_ = nullptr;
       that.size_ = 0;
     }
 
@@ -121,8 +122,11 @@ class PageCacheSlot::Pool : public boost::intrusive_ref_counter<Pool>
     {
       if (this != &that) {
         this->release();
+
         this->pool_ = std::move(that.pool_);
         this->size_ = that.size_;
+
+        that.pool_ = nullptr;
         that.size_ = 0;
       }
       return *this;
@@ -136,8 +140,10 @@ class PageCacheSlot::Pool : public boost::intrusive_ref_counter<Pool>
     void release()
     {
       if (this->pool_) {
-        this->pool_->resident_size_.fetch_sub(this->size_);
+        const i64 prior_resident_size = this->pool_->resident_size_.fetch_sub(this->size_);
+        BATT_CHECK_GE(prior_resident_size, (i64)this->size_);
         this->pool_ = nullptr;
+        this->size_ = 0;
       }
     }
 

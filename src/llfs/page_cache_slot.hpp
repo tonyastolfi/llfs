@@ -438,7 +438,11 @@ BATT_ALWAYS_INLINE inline void PageCacheSlot::extend_pin()
 //
 BATT_ALWAYS_INLINE inline void PageCacheSlot::update_latest_use(i64 lru_priority)
 {
-  this->latest_use_.store(std::max<i64>(lru_priority, 1));
+  const i64 desired = std::max<i64>(lru_priority, 1);
+  const i64 observed = this->latest_use_.load();
+  if (observed != desired) {
+    this->latest_use_.store(desired);
+  }
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
