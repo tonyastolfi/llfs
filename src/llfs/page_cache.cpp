@@ -255,8 +255,8 @@ PageCache::PageCache(std::vector<PageArena>&& storage_pool,
   ADD_METRIC_(used_bytes_written);
   ADD_METRIC_(node_write_count);
   ADD_METRIC_(leaf_write_count);
-  ADD_METRIC_(page_read_latency);
-  ADD_METRIC_(page_write_latency);
+  // ADD_METRIC_(page_read_latency);
+  // ADD_METRIC_(page_write_latency);
   ADD_METRIC_(pipeline_wait_latency);
   ADD_METRIC_(update_ref_counts_latency);
   ADD_METRIC_(ref_count_sync_latency);
@@ -276,8 +276,8 @@ PageCache::~PageCache() noexcept
       .remove(this->metrics_.used_bytes_written)
       .remove(this->metrics_.node_write_count)
       .remove(this->metrics_.leaf_write_count)
-      .remove(this->metrics_.page_read_latency)
-      .remove(this->metrics_.page_write_latency)
+      //.remove(this->metrics_.page_read_latency)
+      //.remove(this->metrics_.page_write_latency)
       .remove(this->metrics_.pipeline_wait_latency)
       .remove(this->metrics_.update_ref_counts_latency)
       .remove(this->metrics_.ref_count_sync_latency);
@@ -850,6 +850,14 @@ auto PageCache::find_page_in_cache(PageId page_id, const PageLoadOptions& option
       });
 }
 
+struct AsyncLoadPageOp {
+  PageCache* page_cache = nullptr;
+  Optional<PageLayoutId> required_layout;
+  OkIfNotFound ok_if_not_found;
+  PageCacheSlot::PinnedRef pinned_slot;
+  Optional<std::chrono::steady_clock::time_point> start_time;
+};
+
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 void PageCache::async_load_page_into_slot(const PageCacheSlot::PinnedRef& pinned_slot,
@@ -861,35 +869,35 @@ void PageCache::async_load_page_into_slot(const PageCacheSlot::PinnedRef& pinned
   PageDeviceEntry* const entry = this->get_device_for_page(page_id);
   BATT_CHECK_NOT_NULLPTR(entry);
 
+  auto op = std::make_shared<AsyncLoadPageOp>();
+
+  op->page_cache = this;
+  op->required_layout = required_layout;
+  op->ok_if_not_found = ok_if_not_found;
+  op->pinned_slot = pinned_slot;
+  if (batt::sample_metric_at_rate(batt::Every2ToTheConst<9>{})) {
+    op->start_time = std::chrono::steady_clock::now();
+  }
+
   entry->arena.device().read(
       page_id,
-      /*read_handler=*/[this, required_layout, ok_if_not_found,
-
-                        // Save the metrics and start time so we can record read latency etc.
-                        //
-                        start_time = std::chrono::steady_clock::now(),
-
-                        // Keep a copy of pinned_slot while loading the page to limit the
-                        // amount of churn under heavy read loads.
-                        //
-                        pinned_slot = batt::make_copy(pinned_slot)
-
-  ](StatusOr<std::shared_ptr<const PageBuffer>>&& result) mutable {
-        const PageId page_id = pinned_slot.key();
-        auto* p_metrics = &this->metrics_;
-        auto page_readers = this->page_readers_;
+      /*read_handler=*/[op = std::move(op)]  //
+      (StatusOr<std::shared_ptr<const PageBuffer>>&& result) mutable {
+        const PageId page_id = op->pinned_slot.key();
+        auto* p_metrics = &op->page_cache->metrics_;
+        auto page_readers = op->page_cache->page_readers_;
 
         BATT_DEBUG_INFO("PageCache::find_page_in_cache - read handler");
 
         auto cleanup = batt::finally([&] {
-          pinned_slot = {};
+          op.reset();
         });
 
-        batt::Latch<std::shared_ptr<const PageView>>* latch = pinned_slot.value();
+        batt::Latch<std::shared_ptr<const PageView>>* latch = op->pinned_slot.value();
         BATT_CHECK_NOT_NULLPTR(latch);
 
         if (!result.ok()) {
-          if (!ok_if_not_found) {
+          if (!op->ok_if_not_found) {
 #if LLFS_TRACK_NEW_PAGE_EVENTS
             LLFS_LOG_WARNING() << "recent events for" << BATT_INSPECT(page_id)
                                << BATT_INSPECT(ok_if_not_found) << " (now=" << this->history_end_
@@ -902,7 +910,10 @@ void PageCache::async_load_page_into_slot(const PageCacheSlot::PinnedRef& pinned
           latch->set_value(result.status());
           return;
         }
-        p_metrics->page_read_latency.update(start_time);
+        if (op->start_time) {
+          usize page_size_log2 = batt::log2_ceil((**result).size());
+          p_metrics->page_read_latency[page_size_log2].update(*op->start_time);
+        }
 
         // Page read succeeded!  Find the right typed reader.
         //
@@ -911,11 +922,11 @@ void PageCache::async_load_page_into_slot(const PageCacheSlot::PinnedRef& pinned
 
         p_metrics->total_bytes_read.add(get_page_size(page_data));
 
-        if (required_layout && *required_layout == ShardedPageView::page_layout_id()) {
+        if (op->required_layout && *op->required_layout == ShardedPageView::page_layout_id()) {
           page_view = std::make_shared<ShardedPageView>(std::move(page_data));
 
         } else {
-          Status layout_status = require_page_layout(*page_data, required_layout);
+          Status layout_status = require_page_layout(*page_data, op->required_layout);
           if (!layout_status.ok()) {
             latch->set_value(layout_status);
             return;

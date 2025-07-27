@@ -13,6 +13,8 @@
 #include <llfs/int_types.hpp>
 #include <llfs/metrics.hpp>
 
+#include <array>
+
 namespace llfs {
 
 struct PageCacheMetrics {
@@ -32,8 +34,8 @@ struct PageCacheMetrics {
   CountMetric<u64> total_read_ops{0};
   LatencyMetric allocate_page_alloc_latency;
   LatencyMetric allocate_page_insert_latency;
-  LatencyMetric page_write_latency;
-  LatencyMetric page_read_latency;
+  std::array<LatencyMetric, 32> page_write_latency;
+  std::array<LatencyMetric, 32> page_read_latency;
   LatencyMetric pipeline_wait_latency;
   LatencyMetric update_ref_counts_latency;
   LatencyMetric ref_count_sync_latency;

@@ -216,8 +216,8 @@ Status CommittablePageCacheJob::commit_impl(const JobCommitParams& params, u64 c
 
   // Write new pages.
   //
-  Status write_status = LLFS_COLLECT_LATENCY(job->cache().metrics().page_write_latency,  //
-                                             this->write_new_pages());
+
+  Status write_status = this->write_new_pages();
   BATT_REQUIRE_OK(write_status);
 
   // Make sure the ref_count_updates_ is initialized!
@@ -432,8 +432,8 @@ Status CommittablePageCacheJob::WriteNewPagesContext::await_finish()
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
 auto CommittablePageCacheJob::start_ref_count_updates(const JobCommitParams& params,
-                                                      PageRefCountUpdates& updates,
-                                                      u64 /*callers*/) -> StatusOr<DeadPages>
+                                                      PageRefCountUpdates& updates, u64 /*callers*/)
+    -> StatusOr<DeadPages>
 {
   LLFS_VLOG(1) << "commit(PageCacheJob): updating ref counts";
 
