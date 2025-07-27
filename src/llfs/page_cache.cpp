@@ -850,7 +850,7 @@ auto PageCache::find_page_in_cache(PageId page_id, const PageLoadOptions& option
       });
 }
 
-struct AsyncLoadPageOp {
+struct AsyncLoadPageOp : batt::RefCounted<AsyncLoadPageOp> {
   PageCache* page_cache = nullptr;
   Optional<PageLayoutId> required_layout;
   OkIfNotFound ok_if_not_found;
@@ -869,7 +869,7 @@ void PageCache::async_load_page_into_slot(const PageCacheSlot::PinnedRef& pinned
   PageDeviceEntry* const entry = this->get_device_for_page(page_id);
   BATT_CHECK_NOT_NULLPTR(entry);
 
-  auto op = std::make_shared<AsyncLoadPageOp>();
+  boost::intrusive_ptr<AsyncLoadPageOp> op{new AsyncLoadPageOp{}};
 
   op->page_cache = this;
   op->required_layout = required_layout;
