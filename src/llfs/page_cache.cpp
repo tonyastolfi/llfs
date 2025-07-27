@@ -910,17 +910,18 @@ void PageCache::async_load_page_into_slot(const PageCacheSlot::PinnedRef& pinned
           latch->set_value(result.status());
           return;
         }
-        if (op->start_time) {
-          usize page_size_log2 = batt::log2_ceil((**result).size());
-          p_metrics->page_read_latency[page_size_log2].update(*op->start_time);
-        }
 
         // Page read succeeded!  Find the right typed reader.
         //
         std::shared_ptr<const PageBuffer>& page_data = *result;
+        const PageSize read_page_size = get_page_size(page_data);
         StatusOr<std::shared_ptr<const PageView>> page_view;
 
-        p_metrics->total_bytes_read.add(get_page_size(page_data));
+        if (op->start_time) {
+          usize page_size_log2 = batt::log2_ceil(read_page_size);
+          p_metrics->page_read_latency[page_size_log2].update(*op->start_time);
+        }
+        p_metrics->total_bytes_read.add(read_page_size);
 
         if (op->required_layout && *op->required_layout == ShardedPageView::page_layout_id()) {
           page_view = std::make_shared<ShardedPageView>(std::move(page_data));
