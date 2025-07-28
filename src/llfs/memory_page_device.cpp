@@ -248,7 +248,10 @@ void MemoryPageDevice::ShardedView::read(PageId page_id, ReadHandler&& handler) 
   const i64 page_offset = byte_addr % this->real_device_.page_size();
 
   LLFS_VLOG(1) << "ShardedView::read(" << page_id << ")" << BATT_INSPECT(shard_addr)
-               << BATT_INSPECT(byte_addr) << BATT_INSPECT(full_page) << BATT_INSPECT(page_offset);
+               << BATT_INSPECT(byte_addr) << BATT_INSPECT(full_page) << BATT_INSPECT(page_offset)
+               << BATT_INSPECT(this->shard_size_);
+
+  BATT_CHECK_EQ(page_offset % this->shard_size_, 0);
 
   std::shared_ptr<PageBuffer> buffer = PageBuffer::allocate(this->shard_size_, page_id);
 
