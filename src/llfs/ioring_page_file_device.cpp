@@ -58,8 +58,8 @@ namespace llfs {
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-std::unique_ptr<IoRingPageFileDevice> IoRingPageFileDevice::make_sharded_view(
-    page_device_id_int device_id, PageSize shard_size)
+std::unique_ptr<PageDevice> IoRingPageFileDevice::make_sharded_view(page_device_id_int device_id,
+                                                                    PageSize shard_size)
 {
   BATT_CHECK_NE(device_id, this->get_id());
 

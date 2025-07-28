@@ -62,8 +62,8 @@ class IoRingPageFileDevice : public PageDevice
     return this->physical_layout_;
   }
 
-  std::unique_ptr<IoRingPageFileDevice> make_sharded_view(page_device_id_int device_id,
-                                                          PageSize shard_size);
+  std::unique_ptr<PageDevice> make_sharded_view(page_device_id_int device_id,
+                                                PageSize shard_size) override;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 

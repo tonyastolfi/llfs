@@ -130,15 +130,18 @@ PageCache::PageCache(std::vector<PageArena>&& storage_pool,
       // Is this the right sized page?
       //
       if (get_page_size(arena) == sharded_view.first) {
-        // Limitation: we can currently only create sharded views for IoRingPageFileDevice objects.
+        // Increase the max_page_device_id to allocate a new identifier for the sharded view
+        // device.
         //
-        IoRingPageFileDevice* src_device = arena.device().as_io_ring_page_file_device();
-        if (src_device != nullptr) {
-          // Increase the max_page_device_id to allocate a new identifier for the sharded view
-          // device.
-          //
-          ++max_page_device_id;
-          const page_device_id_int sharded_view_id = max_page_device_id;
+        const page_device_id_int sharded_view_id = max_page_device_id + 1;
+
+        // Warning: not all PageDevice types currently support sharded views!
+        //
+        std::unique_ptr<PageDevice> sharded_view_device =
+            arena.device().make_sharded_view(sharded_view_id, sharded_view.second);
+
+        if (sharded_view_device != nullptr) {
+          max_page_device_id = sharded_view_id;
 
           // Add a sharded view mapping; we will use this to link devices to their sharded views
           // later.
@@ -148,7 +151,7 @@ PageCache::PageCache(std::vector<PageArena>&& storage_pool,
           // Create a PageDevice and PageArena for the sharded view.
           //
           sharded_view_arenas.emplace_back(PageArena{
-              src_device->make_sharded_view(sharded_view_id, sharded_view.second),
+              std::move(sharded_view_device),
               nullptr,
           });
         }
