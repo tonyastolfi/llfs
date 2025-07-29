@@ -13,6 +13,8 @@
 #include <batteries/bit_ops.hpp>
 #include <batteries/checked_cast.hpp>
 
+#include <iomanip>
+
 namespace llfs {
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -247,8 +249,9 @@ void MemoryPageDevice::ShardedView::read(PageId page_id, ReadHandler&& handler) 
   const i64 full_page = byte_addr / this->real_device_.page_size();
   const i64 page_offset = byte_addr % this->real_device_.page_size();
 
-  LLFS_VLOG(1) << "ShardedView::read(" << page_id << ")" << BATT_INSPECT(shard_addr)
-               << BATT_INSPECT(byte_addr) << BATT_INSPECT(full_page) << BATT_INSPECT(page_offset)
+  LLFS_VLOG(1) << "ShardedView::read(" << page_id << ")" << std::hex << BATT_INSPECT(shard_addr)
+               << std::hex << BATT_INSPECT(byte_addr) << std::hex << BATT_INSPECT(full_page)
+               << std::hex << BATT_INSPECT(page_offset) << std::dec
                << BATT_INSPECT(this->shard_size_);
 
   BATT_CHECK_EQ(page_offset % this->shard_size_, 0);
