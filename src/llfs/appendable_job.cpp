@@ -117,6 +117,9 @@ Status unsafe_commit_job(std::unique_ptr<PageCacheJob>&& job) noexcept
 
   for (PageDeviceEntry* entry : cache.all_devices()) {
     BATT_CHECK_NOT_NULLPTR(entry);
+    if (!entry->can_alloc) {
+      continue;
+    }
     PageAllocator& allocator = entry->arena.allocator();
     Optional<PageAllocatorAttachmentStatus> attach_status =
         allocator.get_client_attachment_status(fake_uuid);
