@@ -122,11 +122,15 @@ batt::StatusOr<PageCacheSlot::PinnedRef> PageDeviceCache::find_or_insert(
         //
         BATT_CHECK(is_same_physical_page(pinned.key(), key));
         pinned.release_ownership_of_pin();
-        if (slot->evict_and_release_pin()) {
+
+        PageCacheSlot::ExternalAllocation claim;
+        if (slot->evict_and_release_pin(&claim)) {
+          BATT_CHECK_EQ(claim.size(), page_size);
+
           this->metrics().evict_prior_generation_count.add(1);
           new_slot.emplace();
           new_slot->p_slot = slot;
-          new_slot->pinned_ref = slot->fill(key, page_size, lru_priority);
+          new_slot->pinned_ref = slot->fill(key, page_size, lru_priority, std::move(claim));
 
           LLFS_PAGE_CACHE_ASSERT_EQ(new_slot->p_slot, observed_slot_ptr);
           break;
@@ -141,15 +145,17 @@ batt::StatusOr<PageCacheSlot::PinnedRef> PageDeviceCache::find_or_insert(
     // into the cache array.
     //
     if (!new_slot) {
+      PageCacheSlot::ExternalAllocation claim;
+
       new_slot.emplace();
-      new_slot->p_slot = this->slot_pool_->allocate(page_size);
+      std::tie(new_slot->p_slot, claim) = this->slot_pool_->allocate(page_size);
       if (!new_slot->p_slot) {
         this->metrics().full_count.add(1);
         return ::llfs::make_status(StatusCode::kCacheSlotsFull);
       }
       LLFS_PAGE_CACHE_ASSERT(!new_slot->p_slot->is_valid());
 
-      new_slot->pinned_ref = new_slot->p_slot->fill(key, page_size, lru_priority);
+      new_slot->pinned_ref = new_slot->p_slot->fill(key, page_size, lru_priority, std::move(claim));
     }
 
     // If we can atomically overwrite the slot index value we saw above (CAS), then we are done!

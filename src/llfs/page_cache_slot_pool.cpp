@@ -138,7 +138,8 @@ PageCacheSlot* PageCacheSlot::Pool::get_slot(usize i)
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-PageCacheSlot* PageCacheSlot::Pool::allocate(PageSize page_size)
+auto PageCacheSlot::Pool::allocate(PageSize page_size)
+    -> std::tuple<PageCacheSlot*, ExternalAllocation>
 {
   this->metrics_.allocate_count.add(1);
 
@@ -232,7 +233,7 @@ PageCacheSlot* PageCacheSlot::Pool::allocate(PageSize page_size)
     }  // for (;;) - loop through slots until resident set <= max
   }
 
-  return free_slot;
+  return {free_slot, ExternalAllocation{*this, page_size}};
 }
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -

@@ -39,10 +39,13 @@ usize PageCacheSlot::index() const
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-auto PageCacheSlot::fill(PageId key, PageSize page_size, i64 lru_priority) -> PinnedRef
+auto PageCacheSlot::fill(PageId key, PageSize page_size, i64 lru_priority, ExternalAllocation claim)
+    -> PinnedRef
 {
   BATT_CHECK(!this->is_valid());
   BATT_CHECK(key.is_valid());
+  BATT_CHECK_EQ(std::addressof(claim.pool()), std::addressof(this->pool_));
+  BATT_CHECK_EQ(claim.size(), page_size);
 
   this->key_ = key;
   this->value_.emplace();
@@ -56,6 +59,8 @@ auto PageCacheSlot::fill(PageId key, PageSize page_size, i64 lru_priority) -> Pi
 
   this->pool_.metrics().admit_count.add(1);
   this->pool_.metrics().admit_byte_count.add(page_size);
+
+  claim.absorb();
 
   this->add_ref();
   this->set_valid();
@@ -72,11 +77,12 @@ void PageCacheSlot::clear()
   this->pool_.metrics().erase_count.add(1);
   this->pool_.metrics().erase_byte_count.add(this->page_size_);
 
+  BATT_CHECK_EQ(this->value_, None);
+  BATT_CHECK_EQ(this->p_value_, nullptr);
+  BATT_CHECK_EQ(this->page_size_, PageSize{0});
+
   this->key_ = PageId{};
-  this->value_ = None;
-  this->p_value_ = nullptr;
   this->latest_use_.store(0);
-  this->page_size_ = PageSize{0};
   this->set_valid();
 }
 
@@ -97,7 +103,7 @@ bool PageCacheSlot::evict()
     //
     const auto target_state = observed_state & ~kValidMask;
     if (this->state_.compare_exchange_weak(observed_state, target_state)) {
-      this->on_evict_success();
+      this->on_evict_success(nullptr);
       return true;
     }
   }
@@ -141,7 +147,7 @@ bool PageCacheSlot::evict_if_key_equals(PageId key)
         << BATT_INSPECT(target_state);
 
     if (this->state_.compare_exchange_weak(observed_state, target_state)) {
-      this->on_evict_success();
+      this->on_evict_success(nullptr);
 
       // At this point, we always expect to be going from pinned to unpinned.
       // In order to successfully evict the slot, we must be holding the only pin,
@@ -155,7 +161,7 @@ bool PageCacheSlot::evict_if_key_equals(PageId key)
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-bool PageCacheSlot::evict_and_release_pin()
+bool PageCacheSlot::evict_and_release_pin(ExternalAllocation* reclaim)
 {
   static_assert(std::is_same_v<decltype(this->state_)::value_type, u64>);
 
@@ -183,7 +189,7 @@ bool PageCacheSlot::evict_and_release_pin()
         << BATT_INSPECT(target_state);
 
     if (this->state_.compare_exchange_weak(observed_state, target_state)) {
-      this->on_evict_success();
+      this->on_evict_success(reclaim);
 
       // At this point, we always expect to be going from pinned to unpinned.
       // In order to successfully evict the slot, we must be holding the only pin,
@@ -197,17 +203,22 @@ bool PageCacheSlot::evict_and_release_pin()
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
 //
-void PageCacheSlot::on_evict_success()
+void PageCacheSlot::on_evict_success(ExternalAllocation* reclaim)
 {
+  BATT_CHECK(!this->is_valid());
+
   this->pool_.metrics().evict_count.add(1);
   this->pool_.metrics().evict_byte_count.add(this->page_size_);
-  this->pool_.resident_size_.fetch_sub(this->page_size_);
+
+  if (reclaim != nullptr) {
+    *reclaim = ExternalAllocation{this->pool_, this->page_size_};
+  } else {
+    this->pool_.resident_size_.fetch_sub(this->page_size_);
+  }
 
   this->value_ = None;
   this->p_value_ = nullptr;
   this->page_size_ = PageSize{0};
-
-  BATT_CHECK(!this->is_valid());
 }
 
 #if LLFS_PAGE_CACHE_SLOT_UPDATE_POOL_REF_COUNT
@@ -227,5 +238,17 @@ void PageCacheSlot::notify_last_ref_released()
 }
 
 #endif  // LLFS_PAGE_CACHE_SLOT_UPDATE_POOL_REF_COUNT
+
+//==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -
+//
+void PageCacheSlot::ExternalAllocation::release() noexcept
+{
+  if (this->pool_) {
+    const i64 prior_resident_size = this->pool_->resident_size_.fetch_sub(this->size_);
+    BATT_CHECK_GE(prior_resident_size, (i64)this->size_);
+    this->pool_ = nullptr;
+    this->size_ = 0;
+  }
+}
 
 }  //namespace llfs

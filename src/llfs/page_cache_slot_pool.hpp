@@ -16,6 +16,8 @@
 #include <boost/lockfree/policies.hpp>
 #include <boost/lockfree/queue.hpp>
 
+#include <tuple>
+
 namespace llfs {
 
 /** \brief A pool of PageCacheSlot objects.
@@ -98,66 +100,7 @@ class PageCacheSlot::Pool : public boost::intrusive_ref_counter<Pool>
     Metrics() = default;
   };
 
-  class ExternalAllocation
-  {
-   public:
-    friend class Pool;
-
-    ExternalAllocation() noexcept : pool_{nullptr}, size_{0}
-    {
-    }
-
-    ExternalAllocation(const ExternalAllocation&) = delete;
-    ExternalAllocation& operator=(const ExternalAllocation&) = delete;
-
-    ExternalAllocation(ExternalAllocation&& that) noexcept
-        : pool_{std::move(that.pool_)}
-        , size_{that.size_}
-    {
-      that.pool_ = nullptr;
-      that.size_ = 0;
-    }
-
-    ExternalAllocation& operator=(ExternalAllocation&& that) noexcept
-    {
-      if (this != &that) {
-        this->release();
-
-        this->pool_ = std::move(that.pool_);
-        this->size_ = that.size_;
-
-        that.pool_ = nullptr;
-        that.size_ = 0;
-      }
-      return *this;
-    }
-
-    ~ExternalAllocation() noexcept
-    {
-      this->release();
-    }
-
-    void release()
-    {
-      if (this->pool_) {
-        const i64 prior_resident_size = this->pool_->resident_size_.fetch_sub(this->size_);
-        BATT_CHECK_GE(prior_resident_size, (i64)this->size_);
-        this->pool_ = nullptr;
-        this->size_ = 0;
-      }
-    }
-
-    //+++++++++++-+-+--+----- --- -- -  -  -   -
-   private:
-    ExternalAllocation(Pool& pool, usize size) noexcept : pool_{&pool}, size_{size}
-    {
-    }
-
-    //+++++++++++-+-+--+----- --- -- -  -  -   -
-
-    boost::intrusive_ptr<Pool> pool_;
-    usize size_;
-  };
+  using ExternalAllocation = PageCacheSlot::ExternalAllocation;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
@@ -207,7 +150,7 @@ class PageCacheSlot::Pool : public boost::intrusive_ref_counter<Pool>
    * Thereafter, it will attempt to evict an unpinned slot that hasn't been used recently.  If no
    * such slot can be found, `nullptr` will be returned.
    */
-  PageCacheSlot* allocate(PageSize size_needed);
+  auto allocate(PageSize size_needed) -> std::tuple<PageCacheSlot*, ExternalAllocation>;
 
   /** \brief Returns the index of the specified slot object.
    *

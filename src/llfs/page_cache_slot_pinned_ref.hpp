@@ -28,8 +28,8 @@ class CallerPromisesTheyAcquiredPinCount
                                          IgnoreGeneration ignore_generation)
       -> PageCacheSlot::PinnedRef;
 
-  friend auto PageCacheSlot::fill(PageId key, PageSize page_size, i64 lru_priority)
-      -> PageCacheSlot::PinnedRef;
+  friend auto PageCacheSlot::fill(PageId key, PageSize page_size, i64 lru_priority,
+                                  PageCacheSlot::ExternalAllocation) -> PageCacheSlot::PinnedRef;
 };
 
 //==#==========+==+=+=++=+++++++++++-+-+--+----- --- -- -  -  -   -

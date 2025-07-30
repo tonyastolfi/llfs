@@ -124,6 +124,84 @@ class PageCacheSlot
   class AtomicRef;  // defined in <llfs/page_cache_slot_atomic_ref.hpp>
   class PinnedRef;  // defined in <llfs/page_cache_slot_pinned_ref.hpp>
 
+  class ExternalAllocation
+  {
+   public:
+    friend class Pool;
+    friend class PageCacheSlot;
+
+    ExternalAllocation() noexcept : pool_{nullptr}, size_{0}
+    {
+    }
+
+    ExternalAllocation(const ExternalAllocation&) = delete;
+    ExternalAllocation& operator=(const ExternalAllocation&) = delete;
+
+    ExternalAllocation(ExternalAllocation&& that) noexcept
+        : pool_{std::move(that.pool_)}
+        , size_{that.size_}
+    {
+      that.pool_ = nullptr;
+      that.size_ = 0;
+    }
+
+    ExternalAllocation& operator=(ExternalAllocation&& that) noexcept
+    {
+      if (this != &that) {
+        this->release();
+
+        this->pool_ = std::move(that.pool_);
+        this->size_ = that.size_;
+
+        that.pool_ = nullptr;
+        that.size_ = 0;
+      }
+      return *this;
+    }
+
+    ~ExternalAllocation() noexcept
+    {
+      this->release();
+    }
+
+    void release() noexcept;
+
+    Pool& pool() const
+    {
+      return *this->pool_;
+    }
+
+    usize size() const
+    {
+      return this->size_;
+    }
+
+    explicit operator bool() const noexcept
+    {
+      return this->pool_ && this->size_ != 0;
+    }
+
+    //+++++++++++-+-+--+----- --- -- -  -  -   -
+   private:
+    ExternalAllocation(Pool& pool, usize size) noexcept : pool_{&pool}, size_{size}
+    {
+    }
+
+    /** \brief May only be called by PageCacheSlot::fill; releases the claim without changing the
+     * pool_'s resident_size.
+     */
+    void absorb()
+    {
+      this->pool_ = nullptr;
+      this->size_ = 0;
+    }
+
+    //+++++++++++-+-+--+----- --- -- -  -  -   -
+
+    boost::intrusive_ptr<Pool> pool_;
+    usize size_;
+  };
+
   using Self = PageCacheSlot;
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
@@ -268,7 +346,7 @@ class PageCacheSlot
    * caller's pin is transferred to this function; the pin is released regardless of whether the
    * eviction succeeded.
    */
-  bool evict_and_release_pin();
+  bool evict_and_release_pin(ExternalAllocation* reclaim);
 
   /** \brief Resets the key and value for this slot.
    *
@@ -277,7 +355,7 @@ class PageCacheSlot
    *
    * May only be called when the slot is in an invalid state.
    */
-  PinnedRef fill(PageId key, PageSize page_size, i64 lru_priority);
+  PinnedRef fill(PageId key, PageSize page_size, i64 lru_priority, ExternalAllocation claim);
 
   /** \brief Sets the key and value of the slot to empty/null.
    *
@@ -331,7 +409,7 @@ class PageCacheSlot
 
   /** \brief Called when this slot is successfully evicted.
    */
-  void on_evict_success();
+  void on_evict_success(ExternalAllocation* reclaim);
 
   //+++++++++++-+-+--+----- --- -- -  -  -   -
 
